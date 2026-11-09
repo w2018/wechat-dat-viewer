@@ -83,7 +83,7 @@ OP_LOG = TOOL_DIR / "operation_log.jsonl"         # 操作日志（含来源 IP�
 OP_LOG_MAX = 5000                                  # 超过这个行数自动截断，只留最近 5000 条
 CLEAR_CONFIRM = "CLEAR_LOGS"                       # 清空操作日志的二次确认词
 CONFIG_FILE = TOOL_DIR / "wechat_data_root.dat"   # 运行时生成，已被 .gitignore 排除
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 KEY_FILE = TOOL_DIR / "wechat_viewer_key.json"    # 访问密码（PBKDF2 哈希），已被 .gitignore 排除
 
 SESSION_COOKIE = "wv_session"
@@ -299,6 +299,7 @@ class Auth:
 
 SID_RE = re.compile(r"^[0-9a-f]{32}$")
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 BASE_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 ZIP_RE = re.compile(r"^wechat_(image|video)_\d{8}_\d{6}_[0-9a-f]{6}\.zip$")
 
@@ -309,7 +310,7 @@ MIME = {
 EXT_OF_MIME = {v: k for k, v in MIME.items()}
 MEDIA_EXTS = {".dat", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".bmp"}
 CONFIRM_WORD = "MOVE_TO_RECYCLE_BIN"
-BATCH_SIZE = 10
+BATCH_SIZE = 50
 TOKEN_TTL = 600
 
 # 删除时可按类型勾选：同一张图在微信目录里通常有 3 个文件
@@ -615,24 +616,54 @@ class Viewer:
                 base, variant = stem, "main"
             if not BASE_RE.match(base):
                 continue
-            g = groups.setdefault(base, {"base": base, "variants": {}, "size": 0})
+            g = groups.setdefault(base, {"base": base, "variants": {}, "size": 0, "mtime": 0.0})
             g["variants"][variant] = f.name
-            g["size"] += f.stat().st_size
-        return [{"base": g["base"], "size": g["size"],
+            st = f.stat()
+            g["size"] += st.st_size
+            g["mtime"] = max(g["mtime"], st.st_mtime)
+        return [{"base": g["base"], "size": g["size"], "mtime": g["mtime"],
+                 "day": datetime.fromtimestamp(g["mtime"]).strftime("%Y-%m-%d"),
                  "has_main": "main" in g["variants"],
                  "has_hd": "hd" in g["variants"], "has_thumb": "thumb" in g["variants"]}
                 for g in sorted(groups.values(), key=lambda x: x["base"])]
 
-    def images(self, sid: str, month: str, offset: int, limit: int, kind: str = "all"):
+    def images(self, sid: str, month: str, offset: int, limit: int,
+               kind: str = "all", day: str = ""):
         if not SID_RE.match(sid) or not MONTH_RE.match(month):
             return 0, []
         img = self.attach / sid / month / "Img"
         if not img.is_dir():
             return 0, []
         items = self._group_files(img)
+        items.sort(key=lambda it: (-it["mtime"], it["base"]))   # 新的在前
         if kind in KIND_ORDER:                      # 按卡片上显示的标签筛，三者互斥
             items = [it for it in items if group_kind(it) == kind]
+        if DAY_RE.match(day or ""):
+            items = [it for it in items if it["day"] == day]
         return len(items), (items[offset:offset + limit] if limit > 0 else items)
+
+    def days(self, zone: str, sid: str, month: str, kind: str = "all") -> list[dict]:
+        """按月汇总每天的项数与占用，用于界面上的日期分组头。"""
+        if zone == "image":
+            if not SID_RE.match(sid) or not MONTH_RE.match(month):
+                return []
+            img = self.attach / sid / month / "Img"
+            if not img.is_dir():
+                return []
+            items = self._group_files(img)
+            if kind in KIND_ORDER:
+                items = [it for it in items if group_kind(it) == kind]
+        elif zone == "video":
+            _, items = self.videos(month, 0, 0)
+        else:
+            return []
+        agg: dict[str, dict] = {}
+        for it in items:
+            d = it["day"]
+            a = agg.setdefault(d, {"day": d, "count": 0, "size": 0})
+            a["count"] += 1
+            a["size"] += it["size"]
+        return [agg[k] for k in sorted(agg, reverse=True)]
 
     def needs_ffmpeg(self, sid: str, month: str, base: str) -> bool:
         """只读文件前 1KB，判断明文头是否为 wxgf（需要 ffmpeg 才能预览）。"""
@@ -709,7 +740,7 @@ class Viewer:
         names = [f"{base}.mp4", f"{base}_thumb.jpg", f"{base}.jpg"]
         return [self._safe_media(d / n) for n in names if (d / n).is_file()]
 
-    def videos(self, month: str, offset: int, limit: int):
+    def videos(self, month: str, offset: int, limit: int, day: str = ""):
         if not MONTH_RE.match(month):
             return 0, []
         d = self.video_dir / month
@@ -720,15 +751,20 @@ class Viewer:
             base = f.stem
             if not BASE_RE.match(base):
                 continue
-            size = f.stat().st_size
+            meta = file_meta(f)
+            size = meta["size"]
             for extra in (f"{base}_thumb.jpg", f"{base}.jpg"):
                 ep = d / extra
                 if ep.is_file():
                     size += ep.stat().st_size
             # 视频分区只展示日期与大小，不做分辨率/时长解析
             items.append({"base": base, "size": size,
-                          "date": file_meta(f)["mtime_str"],
+                          "mtime": meta["mtime"], "day": meta["mtime_str"][:10],
+                          "date": meta["mtime_str"],
                           "has_thumb": (d / f"{base}_thumb.jpg").is_file() or (d / f"{base}.jpg").is_file()})
+        items.sort(key=lambda it: (-it["mtime"], it["base"]))
+        if DAY_RE.match(day or ""):
+            items = [it for it in items if it["day"] == day]
         return len(items), (items[offset:offset + limit] if limit > 0 else items)
 
     def video_thumb(self, month: str, base: str):
@@ -804,8 +840,6 @@ class Viewer:
         bases = payload.get("bases", [])
         if zone not in ("image", "video") or not MONTH_RE.match(month):
             raise ValueError("分区或月份无效")
-        if len(bases) > 500:
-            raise ValueError("单次最多 500 项，请分批操作")
         out = []
         for base in bases:
             if not BASE_RE.match(str(base)):
@@ -1215,8 +1249,12 @@ class Handler(BaseHTTPRequestHandler):
                 total, items = v.images(q.get("sid", [""])[0], q.get("month", [""])[0],
                                         max(0, int(q.get("offset", ["0"])[0])),
                                         min(600, max(0, int(q.get("limit", ["120"])[0]))),
-                                        q.get("kind", ["all"])[0])
+                                        q.get("kind", ["all"])[0],
+                                        q.get("day", [""])[0])
                 self._json({"total": total, "items": items})
+            elif u.path == "/api/days":
+                self._json(v.days(q.get("zone", ["image"])[0], q.get("sid", [""])[0],
+                                  q.get("month", [""])[0], q.get("kind", ["all"])[0]))
             elif u.path == "/api/img":
                 data, mime = v.image_bytes(q.get("sid", [""])[0], q.get("month", [""])[0],
                                            q.get("base", [""])[0], q.get("kind", ["thumb"])[0])
@@ -1233,7 +1271,8 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/videos":
                 total, items = v.videos(q.get("month", [""])[0],
                                         max(0, int(q.get("offset", ["0"])[0])),
-                                        min(600, max(0, int(q.get("limit", ["120"])[0]))))
+                                        min(600, max(0, int(q.get("limit", ["120"])[0]))),
+                                        q.get("day", [""])[0])
                 self._json({"total": total, "items": items})
             elif u.path == "/api/video_thumb":
                 data, mime = v.video_thumb(q.get("month", [""])[0], q.get("base", [""])[0])

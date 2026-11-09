@@ -30,6 +30,13 @@ main{padding:14px 20px 40px}
 .months{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
 .months button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
+#grid{display:block}
+.daysec{margin:0 0 18px}
+.dayhead{display:flex;align-items:center;gap:10px;padding:7px 10px;margin:0 0 8px;background:#eef2f7;border:1px solid var(--line);border-radius:7px}
+.dayhead .dall{display:flex;align-items:center;gap:7px;font-weight:700;font-size:13px;cursor:pointer;font-family:Consolas,monospace}
+.dayhead .dall input{margin:0;width:15px;height:15px}
+.dayhead .dstat{margin-left:auto;color:var(--sub);font-size:12px;white-space:nowrap}
+.dgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
 .cell{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden;position:relative;cursor:pointer}
 .cell.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.18)}
 #box #big{transition:transform .12s ease-out;touch-action:none;user-select:none;-webkit-user-drag:none}
@@ -51,6 +58,9 @@ main{padding:14px 20px 40px}
 #tip b{color:var(--text)}#tip .k{color:var(--sub);display:inline-block;min-width:64px}
 #tipmask{display:none}
 #box{display:none;position:fixed;inset:0;background:rgba(15,20,30,.92);z-index:20;align-items:center;justify-content:center;flex-direction:column}
+#boxsel{display:none;position:fixed;z-index:38;border:1px solid #2563eb;background:rgba(37,99,235,.12);border-radius:2px;pointer-events:none}
+body.bxing{user-select:none;-webkit-user-select:none;cursor:crosshair}
+body.bxing .cell{cursor:crosshair}
 #box.on{display:flex}#box img,#box video{max-width:94vw;max-height:84vh;object-fit:contain;background:#000}
 #box .cap{color:#dbe2ea;margin-top:10px;font-size:12px}
 #box .close{position:absolute;top:16px;right:20px;color:#fff;background:none;border:1px solid #6b7280;font-size:16px;padding:4px 12px}
@@ -209,6 +219,11 @@ body .bar select{margin-top:2px}
 .months button{flex:0 0 auto;padding:6px 12px}
 main{padding:10px 10px 20px}
 .grid{grid-template-columns:repeat(2,1fr);gap:8px}
+  .dgrid{grid-template-columns:repeat(2,1fr);gap:8px}
+  .dayhead{padding:6px 8px;margin-bottom:6px}
+  .dayhead .dall{font-size:12px}
+  .dayhead .dstat{font-size:11px}
+  .daysec{margin-bottom:12px}
 .cell{cursor:pointer}
 .cell img{height:38vw;max-height:190px}
 .cell .meta{font-size:10px;padding:5px 6px}
@@ -253,6 +268,7 @@ APP_JS = r"""
 const MOBILE=__MOBILE_FLAG__;
 let ZONE='image',SID='',MONTH='',KIND='all',OFFSET=0,LIMIT=MOBILE?60:120,TOTAL=0,ALLOW=false,PENDING=null,CUR=-1;
 const SEL=new Set(), INFO={};
+let SEL_SIZE={}, DAYS=[], DAYMAP={}, DAY_EL={}, DAY_BASES={};   // 按天分组：汇总、已建区块、已取到的全部 base
 let TIP_T=null, TIP_POS=null, TIP_SEQ=0, LOAD_SEQ=0;
 let ZOOM=1, PANX=0, PANY=0, DRAG=null, SUPPRESS=false;
 function applyZoom(){const b=$('big');b.style.transform=`translate(${PANX}px,${PANY}px) scale(${ZOOM})`;b.style.cursor=ZOOM>1?'grab':'default'}
@@ -269,9 +285,113 @@ async function api(u,opt){
 function post(u,obj){return api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)})}
 function stub(){return{zone:ZONE,sid:SID,month:MONTH,bases:[...SEL]}}
 function updateStat(){
-  let n=0,s=0;for(const b of SEL){const it=ITEMS.find(x=>x.base===b);if(it){n++;s+=it.size}}
-  $('selstat').textContent=`已选 ${n} 项 · ${fmt(s)}`;
-  $('btn-export').disabled=n===0;$('btn-delete').disabled=n===0||!ALLOW;
+  let s=0;for(const b of SEL)s+=SEL_SIZE[b]||0;
+  $('selstat').textContent=`已选 ${SEL.size} 项 · ${fmt(s)}`;
+  $('btn-export').disabled=SEL.size===0;$('btn-delete').disabled=SEL.size===0||!ALLOW;
+  syncDayHeads();
+}
+function syncDayHeads(){
+  Object.keys(DAY_EL).forEach(day=>{
+    const sec=DAY_EL[day],ck=sec&&sec.querySelector('.dchk');
+    if(!ck)return;
+    const total=(DAYMAP[day]||{}).count||0;
+    const bases=DAY_BASES[day]||ITEMS.filter(x=>x.day===day).map(x=>x.base);
+    let sel=0;bases.forEach(b=>{if(SEL.has(b))sel++});
+    const all=bases.length>0&&(total>0?sel>=total:sel===bases.length);
+    ck.checked=all;
+    ck.indeterminate=sel>0&&!all;
+  });
+}
+// 桌面端鼠标框选：按下拖动出矩形，命中即勾选；Ctrl/Shift 拖动为追加
+let BOX=null, JUST_DRAGGED=false, BOX_RAF=null, BOX_STAT=0;
+function boxOverlay(){
+  let el=$('boxsel');
+  if(!el){el=document.createElement('div');el.id='boxsel';document.body.appendChild(el)}
+  return el;
+}
+function boxRect(){
+  return {left:Math.min(BOX.x0,BOX.x1),right:Math.max(BOX.x0,BOX.x1),
+          top:Math.min(BOX.y0,BOX.y1),bottom:Math.max(BOX.y0,BOX.y1)};
+}
+function boxApply(){
+  const r=boxRect();
+  $('grid').querySelectorAll('.cell').forEach(c=>{
+    const b=c.getBoundingClientRect();
+    const hit=!(b.right<r.left||b.left>r.right||b.bottom<r.top||b.top>r.bottom);
+    const on=hit||(BOX.base&&BOX.base.has(c.dataset.base));
+    if(on)SEL.add(c.dataset.base);else SEL.delete(c.dataset.base);
+    c.classList.toggle('sel',on);
+    const ck=c.querySelector('.chk');if(ck)ck.checked=on;
+  });
+  const now=Date.now();
+  if(now-BOX_STAT>120){BOX_STAT=now;updateStat()}   // 拖动中节流刷新底部统计
+}
+function boxScrollTick(){
+  BOX_RAF=null;
+  if(!BOX||!BOX.moved)return;
+  const y=BOX.y1,h=innerHeight;
+  let d=0;
+  if(y>h-46)d=Math.min(28,Math.round((y-(h-46))/2));
+  else if(y<46)d=-Math.min(28,Math.round((46-y)/2));
+  if(d){
+    const before=scrollY;
+    scrollBy(0,d);
+    if(scrollY!==before)boxApply();               // 页面滚动后命中范围要重算
+    BOX_RAF=requestAnimationFrame(boxScrollTick);
+  }
+}
+function setupBoxSelect(){
+  if(MOBILE)return;
+  const grid=$('grid');
+  grid.addEventListener('mousedown',e=>{
+    if(e.button!==0)return;
+    if(e.target.closest('.dayhead'))return;             // 组头复选框不参与框选
+    if(e.target.tagName==='INPUT')return;
+    if($('box').classList.contains('on'))return;        // 预览层打开时不框选
+    BOX={x0:e.clientX,y0:e.clientY,x1:e.clientX,y1:e.clientY,moved:false,
+         add:e.ctrlKey||e.metaKey||e.shiftKey,base:new Set(SEL)};
+    JUST_DRAGGED=false;
+    e.preventDefault();                                 // 阻止图片被原生拖拽
+  });
+  addEventListener('mousemove',e=>{
+    if(!BOX)return;
+    if(!BOX.moved){
+      if(Math.abs(e.clientX-BOX.x0)<4&&Math.abs(e.clientY-BOX.y0)<4)return;
+      BOX.moved=true;
+      document.body.classList.add('bxing');
+      const el=boxOverlay();el.style.display='block';
+      if(!BOX.add){                                     // 不按修饰键 = 覆盖选择
+        SEL.clear();
+        grid.querySelectorAll('.cell').forEach(c=>{c.classList.remove('sel');const ck=c.querySelector('.chk');if(ck)ck.checked=false});
+      }
+      hideTip();
+      if(!BOX_RAF)BOX_RAF=requestAnimationFrame(boxScrollTick);
+    }
+    BOX.x1=Math.max(0,Math.min(innerWidth,e.clientX));
+    BOX.y1=Math.max(0,Math.min(innerHeight,e.clientY));
+    const r=boxRect(),el=boxOverlay();
+    el.style.left=r.left+'px';el.style.top=r.top+'px';
+    el.style.width=(r.right-r.left)+'px';el.style.height=(r.bottom-r.top)+'px';
+    boxApply();
+  },true);
+  addEventListener('mouseup',e=>{
+    if(!BOX)return;
+    const moved=BOX.moved;
+    BOX=null;
+    if(BOX_RAF){cancelAnimationFrame(BOX_RAF);BOX_RAF=null}
+    document.body.classList.remove('bxing');
+    const el=$('boxsel');if(el)el.style.display='none';
+    JUST_DRAGGED=moved;                                 // 紧跟其后的 click 不要再切换勾选
+    updateStat();
+    if(moved)setTimeout(()=>{JUST_DRAGGED=false},0);
+  },true);
+  addEventListener('mouseleave',()=>{                   // 鼠标移出窗口也要收尾
+    if(!BOX)return;
+    BOX=null;
+    if(BOX_RAF){cancelAnimationFrame(BOX_RAF);BOX_RAF=null}
+    document.body.classList.remove('bxing');
+    const el=$('boxsel');if(el)el.style.display='none';
+  });
 }
 async function init(){
   const k=await api('/api/status');ALLOW=k.allow_delete;
@@ -292,8 +412,15 @@ async function init(){
     load(false).finally(()=>{$('more').disabled=false});
   };
   $('selall').onchange=e=>{
-    [...$('grid').children].forEach(c=>{const b=c.dataset.base;if(e.target.checked)SEL.add(b);else SEL.delete(b);c.classList.toggle('sel',e.target.checked);c.querySelector('.chk').checked=e.target.checked});updateStat();
+    $('grid').querySelectorAll('.cell').forEach(c=>{
+      const b=c.dataset.base;
+      if(e.target.checked)SEL.add(b);else SEL.delete(b);
+      c.classList.toggle('sel',e.target.checked);
+      const ck=c.querySelector('.chk');if(ck)ck.checked=e.target.checked;
+    });
+    updateStat();
   };
+  setupBoxSelect();
   await startScan();
 }
 async function logout(){
@@ -335,6 +462,7 @@ function switchZone(z){
 function clearSelection(){
   LOAD_SEQ++;                                  // 作废在途的旧请求，避免回来后画到新会话上
   SEL.clear();ITEMS=[];OFFSET=0;MONTH='';PENDING=null;
+  SEL_SIZE={};DAYS=[];DAYMAP={};DAY_EL={};DAY_BASES={};
   $('grid').innerHTML='';$('stat').textContent='';$('more').style.display='none';
   updateStat();
 }
@@ -344,10 +472,69 @@ async function showMonths(){
   [...$('months').children].forEach(b=>b.onclick=()=>{MONTH=b.dataset.m;[...$('months').children].forEach(x=>x.classList.remove('on'));b.classList.add('on');load(true)});
   if(ms.length){MONTH=ms[ms.length-1];$('months').lastChild.classList.add('on');load(true)}else{reset('该分区没有内容')}
 }
-function reset(msg){LOAD_SEQ++;$('grid').innerHTML='';ITEMS=[];$('more').style.display='none';$('empty').textContent=msg;$('empty').style.display='block';$('stat').textContent='';SEL.clear();updateStat()}
+function reset(msg){LOAD_SEQ++;$('grid').innerHTML='';ITEMS=[];SEL_SIZE={};DAYS=[];DAYMAP={};DAY_EL={};DAY_BASES={};$('more').style.display='none';$('empty').textContent=msg;$('empty').style.display='block';$('stat').textContent='';SEL.clear();updateStat()}
+async function fetchDays(){
+  const u=ZONE==='image'
+    ? `/api/days?zone=image&sid=${SID}&month=${MONTH}&kind=${KIND}`
+    : `/api/days?zone=video&month=${MONTH}`;
+  try{
+    const arr=await api(u);
+    DAYMAP={};arr.forEach(d=>{DAYMAP[d.day]=d});
+    return arr;
+  }catch(e){return []}
+}
+function ensureDay(day){
+  if(DAY_EL[day])return DAY_EL[day];
+  const m=DAYMAP[day]||{count:0,size:0};
+  const sec=document.createElement('section');
+  sec.className='daysec';sec.dataset.day=day;
+  sec.innerHTML=`<div class="dayhead"><label class="dall"><input type="checkbox" class="dchk" title="勾选/取消这一天全部"><span>${day}</span></label><span class="dstat">${m.count} 项 · ${fmt(m.size)}</span></div><div class="dgrid"></div>`;
+  sec.querySelector('.dchk').onchange=e=>toggleDay(day,e.target.checked,e.target);
+  $('grid').appendChild(sec);
+  sec._g=sec.querySelector('.dgrid');
+  DAY_EL[day]=sec;
+  return sec;
+}
+// 取某一天的全部 base（含分页里还没画出来的），点组头勾选时用
+async function dayBases(day){
+  if(DAY_BASES[day])return DAY_BASES[day];
+  const mo=MONTH,sid=SID,zone=ZONE;
+  const u=zone==='image'
+    ? `/api/images?sid=${sid}&month=${mo}&offset=0&limit=0&kind=${KIND}&day=${day}`
+    : `/api/videos?month=${mo}&offset=0&limit=0&day=${day}`;
+  const d=await api(u);
+  if(mo!==MONTH||sid!==SID||zone!==ZONE)return [];        // 请求期间环境已变，不写缓存
+  d.items.forEach(x=>{SEL_SIZE[x.base]=x.size});
+  DAY_BASES[day]=d.items.map(x=>x.base);
+  return DAY_BASES[day];
+}
+async function toggleDay(day,on,el){
+  const mo=MONTH,sid=SID,zone=ZONE;
+  if(el)el.disabled=true;
+  try{
+    const bases=await dayBases(day);
+    if(mo!==MONTH||sid!==SID||zone!==ZONE){if(el)el.checked=!on;return}   // 期间换了月份/会话，作废
+    const set=new Set(bases);
+    bases.forEach(b=>{on?SEL.add(b):SEL.delete(b)});
+    $('grid').querySelectorAll('.cell').forEach(c=>{
+      if(!set.has(c.dataset.base))return;
+      c.classList.toggle('sel',on);
+      const ck=c.querySelector('.chk');if(ck)ck.checked=on;
+    });
+    updateStat();
+  }catch(e){
+    if(el)el.checked=!on;
+    alert('读取该日期失败：'+e.message);
+  }finally{if(el)el.disabled=false;syncDayHeads()}
+}
 async function load(fresh){
   const seq=++LOAD_SEQ;                       // 只认最后一次请求，过期结果直接丢
-  if(fresh){OFFSET=0;$('grid').innerHTML='';ITEMS=[];SEL.clear()}
+  if(fresh){
+    OFFSET=0;$('grid').innerHTML='';ITEMS=[];SEL.clear();
+    SEL_SIZE={};DAYMAP={};DAY_EL={};DAY_BASES={};
+    DAYS=await fetchDays();
+    if(seq!==LOAD_SEQ)return;
+  }
   const start=OFFSET;
   const u=ZONE==='image'?`/api/images?sid=${SID}&month=${MONTH}&offset=${start}&limit=${LIMIT}&kind=${KIND}`:`/api/videos?month=${MONTH}&offset=${start}&limit=${LIMIT}`;
   const d=await api(u);
@@ -358,6 +545,7 @@ async function load(fresh){
   if(!d.items.length){$('more').style.display='none';return}
   const seen=new Set(ITEMS.map(x=>x.base));   // 分页期间目录变动会产生重复，跳过去重
   d.items.forEach(it=>{
+    SEL_SIZE[it.base]=it.size;                // 未加载的分页项也要能算大小
     if(seen.has(it.base))return;
     seen.add(it.base);
     ITEMS.push(it);
@@ -372,19 +560,19 @@ async function load(fresh){
     const ck=c.querySelector('.chk');
     const toggle=on=>{if(on)SEL.add(it.base);else SEL.delete(it.base);c.classList.toggle('sel',on);if(ck)ck.checked=on;updateStat()};
     if(ck)ck.onclick=e=>{e.stopPropagation();toggle(e.target.checked)};
-    c.onclick=e=>{if(e.target===ck||e.target.closest('.info'))return;toggle(!SEL.has(it.base))};
-    c.ondblclick=e=>{if(e.target===ck||e.target.closest('.info'))return;e.preventDefault();openBox(it)};
+    c.onclick=e=>{if(JUST_DRAGGED)return;if(e.target===ck||e.target.closest('.info'))return;toggle(!SEL.has(it.base))};
+    c.ondblclick=e=>{if(JUST_DRAGGED)return;if(e.target===ck||e.target.closest('.info'))return;e.preventDefault();openBox(it)};
     if(MOBILE){
       c.querySelector('.info').onclick=e=>{e.stopPropagation();showTip(it.base)};
     }else{
-      c.onmouseenter=e=>{TIP_POS={clientX:e.clientX,clientY:e.clientY};clearTimeout(TIP_T);TIP_T=setTimeout(()=>showTip(it.base,TIP_POS),500)};
+      c.onmouseenter=e=>{if(BOX&&BOX.moved)return;TIP_POS={clientX:e.clientX,clientY:e.clientY};clearTimeout(TIP_T);TIP_T=setTimeout(()=>showTip(it.base,TIP_POS),500)};
       c.onmousemove=e=>{TIP_POS={clientX:e.clientX,clientY:e.clientY};if($('tip').style.display==='block')moveTip(TIP_POS)};
       c.onmouseleave=()=>{clearTimeout(TIP_T);hideTip()};
     }
-    $('grid').appendChild(c);
+    ensureDay(it.day)._g.appendChild(c);
   });
   OFFSET=start+d.items.length;
-  $('stat').textContent=`${MONTH}${({all:'',hd:' · 原图',main:' · 普通图',thumb:' · 缩略图'})[KIND]||''} · 共 ${TOTAL} 项 · 已显示 ${OFFSET} 项`;
+  $('stat').textContent=`${MONTH}${({all:'',hd:' · 原图',main:' · 普通图',thumb:' · 缩略图'})[KIND]||''} · 共 ${TOTAL} 项 / ${DAYS.length} 天 · 已显示 ${OFFSET} 项`;
   $('more').style.display=OFFSET<TOTAL?'block':'none';
   $('selall').checked=false;updateStat();
 }
