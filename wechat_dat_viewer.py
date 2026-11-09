@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import csv
 import hashlib
 import hmac
@@ -83,7 +84,7 @@ OP_LOG = TOOL_DIR / "operation_log.jsonl"         # 操作日志（含来源 IP�
 OP_LOG_MAX = 5000                                  # 超过这个行数自动截断，只留最近 5000 条
 CLEAR_CONFIRM = "CLEAR_LOGS"                       # 清空操作日志的二次确认词
 CONFIG_FILE = TOOL_DIR / "wechat_data_root.dat"   # 运行时生成，已被 .gitignore 排除
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 KEY_FILE = TOOL_DIR / "wechat_viewer_key.json"    # 访问密码（PBKDF2 哈希），已被 .gitignore 排除
 
 SESSION_COOKIE = "wv_session"
@@ -330,6 +331,50 @@ OP_LABEL = {
     "login": "登录", "login_fail": "登录失败", "setup": "设置密码",
     "logout": "退出登录", "export": "导出", "delete": "删除", "clear": "清空日志",
 }
+
+
+def clamp_day(ts: float, month: str) -> str:
+    """文件日期超出所在月份目录时，钳到该月边界。
+
+    微信按月建目录，目录月代表消息时间；mtime 会因为后来点开原图、备份恢复
+    而落到别的月份，直接拿 mtime 当天会出现「5 月里冒出 6 月 5 日」。
+    """
+    d = datetime.fromtimestamp(ts)
+    if not MONTH_RE.match(month or ""):
+        return d.strftime("%Y-%m-%d")
+    cur = d.strftime("%Y-%m")
+    if cur == month:
+        return d.strftime("%Y-%m-%d")
+    if cur < month:
+        return month + "-01"
+    y, mo = int(month[:4]), int(month[5:7])
+    return "%s-%02d" % (month, calendar.monthrange(y, mo)[1])
+
+
+def group_mtime(mts: dict[str, float], month: str) -> float:
+    """挑一个能代表聊天时间的变体时间。
+
+    优先顺序 普通图 > 缩略图 > 原图：`_h.dat` 往往是后来点开原图才下载的，
+    用它会把整组算到下个月。同月优先，跨月的只在没有同月变体时兜底。
+    """
+    order = ("main", "thumb", "hd")
+    for key in order:
+        ts = mts.get(key)
+        if ts is not None and (not month
+                               or datetime.fromtimestamp(ts).strftime("%Y-%m") == month):
+            return ts
+    for key in order:
+        if key in mts:
+            return mts[key]
+    return 0.0
+
+
+def parse_kinds(raw: str) -> set[str]:
+    """解析类型筛选：支持 "all" 或 "hd,main" 多选；非法值退化为全选。"""
+    if not raw or raw == "all":
+        return set(KIND_ORDER)
+    got = {k.strip() for k in str(raw).split(",") if k.strip() in KIND_ORDER}
+    return got or set(KIND_ORDER)
 
 
 def group_kind(item: dict) -> str:
@@ -616,16 +661,21 @@ class Viewer:
                 base, variant = stem, "main"
             if not BASE_RE.match(base):
                 continue
-            g = groups.setdefault(base, {"base": base, "variants": {}, "size": 0, "mtime": 0.0})
+            g = groups.setdefault(base, {"base": base, "variants": {}, "size": 0, "mts": {}})
             g["variants"][variant] = f.name
             st = f.stat()
             g["size"] += st.st_size
-            g["mtime"] = max(g["mtime"], st.st_mtime)
-        return [{"base": g["base"], "size": g["size"], "mtime": g["mtime"],
-                 "day": datetime.fromtimestamp(g["mtime"]).strftime("%Y-%m-%d"),
-                 "has_main": "main" in g["variants"],
-                 "has_hd": "hd" in g["variants"], "has_thumb": "thumb" in g["variants"]}
-                for g in sorted(groups.values(), key=lambda x: x["base"])]
+            g["mts"][variant] = st.st_mtime
+        month = img_dir.parent.name
+        out = []
+        for g in groups.values():
+            ts = group_mtime(g["mts"], month)
+            out.append({"base": g["base"], "size": g["size"], "mtime": ts,
+                        "day": clamp_day(ts, month),
+                        "has_main": "main" in g["variants"],
+                        "has_hd": "hd" in g["variants"],
+                        "has_thumb": "thumb" in g["variants"]})
+        return sorted(out, key=lambda x: x["base"])
 
     def images(self, sid: str, month: str, offset: int, limit: int,
                kind: str = "all", day: str = ""):
@@ -636,8 +686,9 @@ class Viewer:
             return 0, []
         items = self._group_files(img)
         items.sort(key=lambda it: (-it["mtime"], it["base"]))   # 新的在前
-        if kind in KIND_ORDER:                      # 按卡片上显示的标签筛，三者互斥
-            items = [it for it in items if group_kind(it) == kind]
+        wanted = parse_kinds(kind)                  # 多选：取并集，标签本身互斥
+        if wanted != set(KIND_ORDER):
+            items = [it for it in items if group_kind(it) in wanted]
         if DAY_RE.match(day or ""):
             items = [it for it in items if it["day"] == day]
         return len(items), (items[offset:offset + limit] if limit > 0 else items)
@@ -651,8 +702,9 @@ class Viewer:
             if not img.is_dir():
                 return []
             items = self._group_files(img)
-            if kind in KIND_ORDER:
-                items = [it for it in items if group_kind(it) == kind]
+            wanted = parse_kinds(kind)
+            if wanted != set(KIND_ORDER):
+                items = [it for it in items if group_kind(it) in wanted]
         elif zone == "video":
             _, items = self.videos(month, 0, 0)
         else:
@@ -759,7 +811,7 @@ class Viewer:
                     size += ep.stat().st_size
             # 视频分区只展示日期与大小，不做分辨率/时长解析
             items.append({"base": base, "size": size,
-                          "mtime": meta["mtime"], "day": meta["mtime_str"][:10],
+                          "mtime": meta["mtime"], "day": clamp_day(meta["mtime"], month),
                           "date": meta["mtime_str"],
                           "has_thumb": (d / f"{base}_thumb.jpg").is_file() or (d / f"{base}.jpg").is_file()})
         items.sort(key=lambda it: (-it["mtime"], it["base"]))

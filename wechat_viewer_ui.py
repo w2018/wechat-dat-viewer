@@ -79,7 +79,14 @@ body.bxing .cell{cursor:crosshair}
 #scanfill{height:100%;width:0;background:var(--accent);transition:width .25s}
 #scantext{font-size:12px;color:var(--sub);white-space:nowrap}
 #scantext.done{color:#16a34a}#scantext.err{color:var(--danger)}
-.kfilter{font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text);cursor:pointer;flex:none}
+.kinds{display:flex;gap:6px;align-items:center;flex:none}
+.kchip{display:flex;align-items:center;gap:5px;padding:5px 9px;border:1px solid var(--line);border-radius:6px;background:#fff;font-size:12.5px;color:var(--sub);cursor:pointer;user-select:none;font-weight:600}
+.kchip input{margin:0;width:13px;height:13px;cursor:pointer;accent-color:var(--accent)}
+.kchip:has(input:checked){border-color:var(--accent);background:#eff6ff;color:var(--accent)}
+.autoload{display:flex;align-items:center;justify-content:center;gap:8px;padding:14px 0;color:var(--sub);font-size:12.5px}
+.spin{width:15px;height:15px;border:2px solid #d6dbe3;border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.sentinel{height:1px}
 .krow{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;margin-bottom:8px;cursor:pointer;user-select:none}
 .krow:hover{border-color:#c7cdd6}
 .krow.on{border-color:#fca5a5;background:#fff7f7}
@@ -125,11 +132,13 @@ DESKTOP_HTML = r"""
   <div class="scaninfo"><span id="scantext">准备就绪</span><div class="track"><div id="scanfill"></div></div></div>
 </div>
 <div class="bar" id="bar-image">
-  <span class="tag">会话</span><select id="sid" style="min-width:320px;max-width:520px"></select>
-  <select id="kindfilter" class="kfilter" title="按文件类型筛选">
-    <option value="all">全部类型</option><option value="hd">原图</option>
-    <option value="main">普通图</option><option value="thumb">缩略图</option>
-  </select>
+  <span class="tag">会话</span><select id="sid" style="min-width:280px;max-width:520px"></select>
+  <span class="tag">类型</span>
+  <div class="kinds" id="kindfilter" title="可多选，勾中的类型都会显示">
+    <label class="kchip"><input type="checkbox" value="hd" checked><span>原图</span></label>
+    <label class="kchip"><input type="checkbox" value="main" checked><span>普通图</span></label>
+    <label class="kchip"><input type="checkbox" value="thumb" checked><span>缩略图</span></label>
+  </div>
 </div>
 <div class="bar"><div class="months" id="months"></div></div>
 <div class="bar">
@@ -140,7 +149,7 @@ DESKTOP_HTML = r"""
   <span class="tag" id="stat"></span>
 </div>
 </header>
-<main><div class="grid" id="grid"></div><button class="more" id="more" style="display:none">加载更多</button><div class="empty" id="empty">正在加载…</div></main>
+<main><div class="grid" id="grid"></div><div class="autoload" id="autoload" style="display:none"><span class="spin"></span><span>正在加载…</span></div><div class="sentinel" id="sentinel"></div><div class="empty" id="empty">正在加载…</div></main>
 """
 
 # ------------------------------------------------------------------ 手机骨架 ---
@@ -162,16 +171,17 @@ MOBILE_HTML = r"""
     </div>
     <div class="bar" id="bar-image">
       <span class="tag">会话</span><select id="sid"></select>
-      <select id="kindfilter" class="kfilter" title="按文件类型筛选">
-        <option value="all">全部</option><option value="hd">原图</option>
-        <option value="main">普通图</option><option value="thumb">缩略图</option>
-      </select>
+      <div class="kinds" id="kindfilter" title="可多选">
+        <label class="kchip"><input type="checkbox" value="hd" checked><span>原图</span></label>
+        <label class="kchip"><input type="checkbox" value="main" checked><span>普通</span></label>
+        <label class="kchip"><input type="checkbox" value="thumb" checked><span>缩略</span></label>
+      </div>
     </div>
     <div class="months" id="months"></div>
     <div class="bar"><label class="tag"><input type="checkbox" id="selall"> 全选本页</label><span class="tag" id="stat"></span></div>
   </div>
 </header>
-<main><div class="grid" id="grid"></div><button class="more" id="more" style="display:none">加载更多</button><div class="empty" id="empty">正在加载…</div></main>
+<main><div class="grid" id="grid"></div><div class="autoload" id="autoload" style="display:none"><span class="spin"></span><span>正在加载…</span></div><div class="sentinel" id="sentinel"></div><div class="empty" id="empty">正在加载…</div></main>
 <div class="mbar">
   <span class="stat" id="selstat">已选 0 项 · 0 MB</span>
   <button id="btn-export" class="primary">导出</button>
@@ -224,6 +234,9 @@ main{padding:10px 10px 20px}
   .dayhead .dall{font-size:12px}
   .dayhead .dstat{font-size:11px}
   .daysec{margin-bottom:12px}
+  .kinds{gap:4px}
+  .kchip{padding:4px 7px;font-size:11.5px}
+  .autoload{padding:10px 0;font-size:12px}
 .cell{cursor:pointer}
 .cell img{height:38vw;max-height:190px}
 .cell .meta{font-size:10px;padding:5px 6px}
@@ -266,7 +279,15 @@ input[type=checkbox]{width:20px;height:20px}
 
 APP_JS = r"""
 const MOBILE=__MOBILE_FLAG__;
-let ZONE='image',SID='',MONTH='',KIND='all',OFFSET=0,LIMIT=MOBILE?60:120,TOTAL=0,ALLOW=false,PENDING=null,CUR=-1;
+let ZONE='image',SID='',MONTH='',OFFSET=0,LIMIT=300,TOTAL=0,ALLOW=false,PENDING=null,CUR=-1;
+const KINDS=new Set(['hd','main','thumb']);     // 类型多选，三类全选等于不筛
+let LOADING=false, HAS_MORE=false;
+function kindParam(){return KINDS.size>=3?'all':[...KINDS].join(',')||'all'}
+function kindText(){
+  const order=['hd','main','thumb'],map={hd:'原图',main:'普通图',thumb:'缩略图'};
+  const ks=order.filter(k=>KINDS.has(k));
+  return (!ks.length||ks.length===3)?'':' · '+ks.map(k=>map[k]).join('+');
+}
 const SEL=new Set(), INFO={};
 let SEL_SIZE={}, DAYS=[], DAYMAP={}, DAY_EL={}, DAY_BASES={};   // 按天分组：汇总、已建区块、已取到的全部 base
 let TIP_T=null, TIP_POS=null, TIP_SEQ=0, LOAD_SEQ=0;
@@ -398,19 +419,19 @@ async function init(){
   $('keyinfo').textContent='密钥 '+k.key_desc;
   $('mode').textContent=ALLOW?(MOBILE?'可删除':'删除已启用（移入回收站）'):'只读模式';
   $('sid').onchange=()=>{SID=$('sid').value;clearSelection();showMonths()};
-  if($('kindfilter'))$('kindfilter').onchange=e=>{
-    KIND=e.target.value;
-    if(MONTH)load(true);            // load(true) 会清掉旧选择与旧卡片
-  };
+  const kf=$('kindfilter');
+  if(kf)kf.addEventListener('change',e=>{
+    const box=e.target.closest('input[type=checkbox]');
+    if(!box)return;
+    if(box.checked)KINDS.add(box.value);else KINDS.delete(box.value);
+    if(!KINDS.size){box.checked=true;KINDS.add(box.value);return}   // 至少留一类
+    if(MONTH)load(true);            // 重新拉取，旧选择一并清掉
+  });
   $('tab-image').onclick=()=>switchZone('image');$('tab-video').onclick=()=>switchZone('video');
   $('btn-rescan').onclick=()=>startScan();
   if($('btn-logout'))$('btn-logout').onclick=logout;
   if($('btn-menu'))$('btn-menu').onclick=()=>$('panel').classList.toggle('open');
-  $('more').onclick=()=>{
-    if($('more').disabled)return;              // 连点会发出两个同 offset 请求
-    $('more').disabled=true;
-    load(false).finally(()=>{$('more').disabled=false});
-  };
+  setupAutoLoad();
   $('selall').onchange=e=>{
     $('grid').querySelectorAll('.cell').forEach(c=>{
       const b=c.dataset.base;
@@ -463,7 +484,7 @@ function clearSelection(){
   LOAD_SEQ++;                                  // 作废在途的旧请求，避免回来后画到新会话上
   SEL.clear();ITEMS=[];OFFSET=0;MONTH='';PENDING=null;
   SEL_SIZE={};DAYS=[];DAYMAP={};DAY_EL={};DAY_BASES={};
-  $('grid').innerHTML='';$('stat').textContent='';$('more').style.display='none';
+  $('grid').innerHTML='';$('stat').textContent='';HAS_MORE=false;
   updateStat();
 }
 async function showMonths(){
@@ -472,10 +493,10 @@ async function showMonths(){
   [...$('months').children].forEach(b=>b.onclick=()=>{MONTH=b.dataset.m;[...$('months').children].forEach(x=>x.classList.remove('on'));b.classList.add('on');load(true)});
   if(ms.length){MONTH=ms[ms.length-1];$('months').lastChild.classList.add('on');load(true)}else{reset('该分区没有内容')}
 }
-function reset(msg){LOAD_SEQ++;$('grid').innerHTML='';ITEMS=[];SEL_SIZE={};DAYS=[];DAYMAP={};DAY_EL={};DAY_BASES={};$('more').style.display='none';$('empty').textContent=msg;$('empty').style.display='block';$('stat').textContent='';SEL.clear();updateStat()}
+function reset(msg){LOAD_SEQ++;$('grid').innerHTML='';ITEMS=[];SEL_SIZE={};DAYS=[];DAYMAP={};DAY_EL={};DAY_BASES={};$('empty').textContent=msg;$('empty').style.display='block';$('stat').textContent='';SEL.clear();HAS_MORE=false;LOADING=false;showSpin(false);updateStat()}
 async function fetchDays(){
   const u=ZONE==='image'
-    ? `/api/days?zone=image&sid=${SID}&month=${MONTH}&kind=${KIND}`
+    ? `/api/days?zone=image&sid=${SID}&month=${MONTH}&kind=${kindParam()}`
     : `/api/days?zone=video&month=${MONTH}`;
   try{
     const arr=await api(u);
@@ -500,7 +521,7 @@ async function dayBases(day){
   if(DAY_BASES[day])return DAY_BASES[day];
   const mo=MONTH,sid=SID,zone=ZONE;
   const u=zone==='image'
-    ? `/api/images?sid=${sid}&month=${mo}&offset=0&limit=0&kind=${KIND}&day=${day}`
+    ? `/api/images?sid=${sid}&month=${mo}&offset=0&limit=0&kind=${kindParam()}&day=${day}`
     : `/api/videos?month=${mo}&offset=0&limit=0&day=${day}`;
   const d=await api(u);
   if(mo!==MONTH||sid!==SID||zone!==ZONE)return [];        // 请求期间环境已变，不写缓存
@@ -527,8 +548,39 @@ async function toggleDay(day,on,el){
     alert('读取该日期失败：'+e.message);
   }finally{if(el)el.disabled=false;syncDayHeads()}
 }
+function showSpin(on){
+  const el=$('autoload');
+  if(el)el.style.display=on?'flex':'none';
+}
+function maybeLoadMore(){
+  if(LOADING||!HAS_MORE||!MONTH)return;
+  const box=$('box');
+  if(box&&box.classList.contains('on'))return;      // 大图预览时不后台翻页
+  load(false);
+}
+function autoContinue(){
+  // 一页填不满屏幕时 observer 不会再触发，补一次判断
+  if(LOADING||!HAS_MORE||!MONTH)return;
+  const el=$('sentinel');
+  if(el&&el.getBoundingClientRect().top<innerHeight+400)setTimeout(maybeLoadMore,80);
+}
+function setupAutoLoad(){
+  const el=$('sentinel');
+  if(!el)return;
+  if('IntersectionObserver' in window){
+    new IntersectionObserver(es=>{
+      if(es.some(e=>e.isIntersecting))maybeLoadMore();
+    },{rootMargin:'400px 0px'}).observe(el);
+  }else{
+    addEventListener('scroll',()=>{
+      if(innerHeight+scrollY>=document.body.scrollHeight-500)maybeLoadMore();
+    },{passive:true});
+  }
+}
 async function load(fresh){
   const seq=++LOAD_SEQ;                       // 只认最后一次请求，过期结果直接丢
+  LOADING=true;if(!fresh)showSpin(true);
+  try{
   if(fresh){
     OFFSET=0;$('grid').innerHTML='';ITEMS=[];SEL.clear();
     SEL_SIZE={};DAYMAP={};DAY_EL={};DAY_BASES={};
@@ -536,13 +588,13 @@ async function load(fresh){
     if(seq!==LOAD_SEQ)return;
   }
   const start=OFFSET;
-  const u=ZONE==='image'?`/api/images?sid=${SID}&month=${MONTH}&offset=${start}&limit=${LIMIT}&kind=${KIND}`:`/api/videos?month=${MONTH}&offset=${start}&limit=${LIMIT}`;
+  const u=ZONE==='image'?`/api/images?sid=${SID}&month=${MONTH}&offset=${start}&limit=${LIMIT}&kind=${kindParam()}`:`/api/videos?month=${MONTH}&offset=${start}&limit=${LIMIT}`;
   const d=await api(u);
   if(seq!==LOAD_SEQ)return;                   // 期间已换月份/会话，丢弃这一页
   TOTAL=d.total;
   $('empty').style.display=TOTAL?'none':'block';
   if(!TOTAL){reset('该月份没有内容');return}
-  if(!d.items.length){$('more').style.display='none';return}
+  if(!d.items.length){HAS_MORE=false;return}
   const seen=new Set(ITEMS.map(x=>x.base));   // 分页期间目录变动会产生重复，跳过去重
   d.items.forEach(it=>{
     SEL_SIZE[it.base]=it.size;                // 未加载的分页项也要能算大小
@@ -572,9 +624,12 @@ async function load(fresh){
     ensureDay(it.day)._g.appendChild(c);
   });
   OFFSET=start+d.items.length;
-  $('stat').textContent=`${MONTH}${({all:'',hd:' · 原图',main:' · 普通图',thumb:' · 缩略图'})[KIND]||''} · 共 ${TOTAL} 项 / ${DAYS.length} 天 · 已显示 ${OFFSET} 项`;
-  $('more').style.display=OFFSET<TOTAL?'block':'none';
+  $('stat').textContent=`${MONTH}${kindText()} · 共 ${TOTAL} 项 / ${DAYS.length} 天 · 已显示 ${OFFSET} 项`;
+  HAS_MORE=OFFSET<TOTAL;
   $('selall').checked=false;updateStat();
+  }finally{
+    if(seq===LOAD_SEQ){LOADING=false;showSpin(false);autoContinue()}
+  }
 }
 function tipHtml(m){
   const dim=m.width?`${m.width} × ${m.height}`:'未知';
