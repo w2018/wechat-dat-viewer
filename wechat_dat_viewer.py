@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import webbrowser
 import zipfile
@@ -162,6 +163,12 @@ class Viewer:
         self._tokens: dict[str, dict] = {}
         self._meta_cache: dict[tuple, dict] = {}
         self._ff_cache: dict[tuple, bool] = {}
+        self._stats_cache: dict[str, dict] = {}
+        self._scan_lock = threading.Lock()
+        self._scan_state: dict = {"running": False, "done": 0, "total": 0,
+                                  "elapsed": 0.0, "message": "", "finished": False,
+                                  "error": ""}
+        self._sessions_cache: list[dict] | None = None
         self._resolve_keys()
 
     # ------------------------------------------------------------ 初始化 ---
@@ -253,16 +260,49 @@ class Viewer:
         return (datetime.fromtimestamp(min(times)).strftime("%Y-%m-%d"),
                 datetime.fromtimestamp(max(times)).strftime("%Y-%m-%d"))
 
+    def _scan_session_stats(self, d: Path) -> dict:
+        """CSV 缺失时实时统计会话占用与文件数：只读 scandir 递归，结果缓存在内存。"""
+        key = str(d)
+        if key in self._stats_cache:
+            return self._stats_cache[key]
+        total = 0
+        count = 0
+        stack = [str(d)]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append(e.path)
+                            elif e.is_file(follow_symlinks=False):
+                                total += e.stat(follow_symlinks=False).st_size
+                                count += 1
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        res = {"size_bytes": total, "size_mb": round(total / 1048576, 1),
+               "file_count": count}
+        self._stats_cache[key] = res
+        return res
+
     def sessions(self) -> list[dict]:
+        if self._sessions_cache is not None:
+            return self._sessions_cache
         out = []
         for d in self.attach.iterdir():
             if not d.is_dir() or not SID_RE.match(d.name):
                 continue
             months = sorted(m.name for m in d.iterdir() if m.is_dir() and MONTH_RE.match(m.name))
-            meta = self.sessions_meta.get(d.name, {})
+            meta = self.sessions_meta.get(d.name)
+            if not meta or meta.get("file_count", 0) <= 0:
+                meta = self._scan_session_stats(d)
             first_date, last_date = self._session_dates(d, months)
             out.append({
                 "sid": d.name,
+                "size_bytes": int(meta.get("size_bytes", meta.get("size_mb", 0) * 1048576)),
                 "size_mb": round(meta.get("size_mb", 0), 1),
                 "file_count": meta.get("file_count", 0),
                 "months": months,
@@ -272,6 +312,66 @@ class Viewer:
         # 下拉框按最新日期倒序（新 -> 旧），同日再按占用大小倒序
         out.sort(key=lambda x: (x["last_date"] or "", x["size_mb"]), reverse=True)
         return out
+
+    # ------------------------------------------------------- 重新扫描/进度 ---
+    def start_rescan(self) -> dict:
+        """启动后台重新扫描：清空缓存，逐会话重算大小/文件数/日期并更新进度。"""
+        with self._scan_lock:
+            if self._scan_state["running"]:
+                return {"started": False, "message": self._scan_state["message"]}
+            self._scan_state = {"running": True, "done": 0, "total": 0,
+                                "elapsed": 0.0, "message": "准备扫描…",
+                                "finished": False, "error": ""}
+        threading.Thread(target=self._rescan_worker, daemon=True).start()
+        return {"started": True}
+
+    def scan_status(self) -> dict:
+        with self._scan_lock:
+            return dict(self._scan_state)
+
+    def _rescan_worker(self):
+        t0 = time.time()
+        try:
+            dirs = sorted(d for d in self.attach.iterdir()
+                          if d.is_dir() and SID_RE.match(d.name))
+            total = len(dirs)
+            with self._scan_lock:
+                self._scan_state.update(total=total, message=f"正在扫描 0/{total} 个会话…")
+            self._stats_cache.clear()
+            self._meta_cache.clear()
+            self.sessions_meta = {}
+            out = []
+            for i, d in enumerate(dirs, 1):
+                months = sorted(m.name for m in d.iterdir()
+                                if m.is_dir() and MONTH_RE.match(m.name))
+                meta = self._scan_session_stats(d)
+                first_date, last_date = self._session_dates(d, months)
+                out.append({
+                    "sid": d.name,
+                    "size_bytes": int(meta.get("size_bytes", meta.get("size_mb", 0) * 1048576)),
+                    "size_mb": round(meta.get("size_mb", 0), 1),
+                    "file_count": meta.get("file_count", 0),
+                    "months": months,
+                    "first_date": first_date,
+                    "last_date": last_date,
+                })
+                if i % 5 == 0 or i == total:
+                    with self._scan_lock:
+                        self._scan_state.update(
+                            done=i, elapsed=round(time.time() - t0, 1),
+                            message=f"正在扫描 {i}/{total} 个会话…")
+            out.sort(key=lambda x: (x["last_date"] or "", x["size_mb"]), reverse=True)
+            self._sessions_cache = out
+            secs = round(time.time() - t0, 1)
+            with self._scan_lock:
+                self._scan_state.update(
+                    running=False, finished=True, done=total, elapsed=secs,
+                    message=f"扫描完成 · {total} 个会话 · {secs}s")
+        except Exception as e:
+            with self._scan_lock:
+                self._scan_state.update(
+                    running=False, finished=True, error=str(e),
+                    message=f"扫描失败：{e}")
 
     def months(self, sid: str) -> list[str]:
         if not SID_RE.match(sid):
@@ -352,9 +452,9 @@ class Viewer:
             img.relative_to(self.attach.resolve())
         except ValueError:
             return None, None
-        # 缺 ffmpeg 且原图为 wxgf：缩略图与大图都显示简洁占位提示
-        if self.ffmpeg is None and self.needs_ffmpeg(sid, month, base):
-            return None, None
+        # 逐候选回退：高清 -> 主图 -> 缩略图，取第一个能解出的。
+        # 只有整组都解不出时才交给上层显示占位提示（wxgf 原图缺 ffmpeg 时
+        # 通常仍能回退到明文 JPEG 缩略图，不应把整组判为不支持预览）。
         names = ([f"{base}_h.dat", f"{base}.dat", f"{base}_t.dat"] if kind == "full"
                  else [f"{base}_t.dat", f"{base}.dat", f"{base}_h.dat"])
         for name in names:
@@ -459,6 +559,8 @@ class Viewer:
                 fmt = "需要 ffmpeg" if not self.ffmpeg else "无法解码"
             if data and data.startswith(b"wxgf"):
                 fmt = "wxgf (HEVC→JPEG)"
+            if self.ffmpeg is None and self.needs_ffmpeg(sid, month, base):
+                fmt += " · 原图需 ffmpeg"
             out = {"zone": "image", "base": base, "month": month, "sid": sid,
                    "files": [file_meta(p) for p in files],
                    "total_size": sum(f["size"] for f in [file_meta(p) for p in files]),
@@ -648,12 +750,21 @@ main{padding:14px 20px 40px}
 .warn{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;padding:10px 12px;border-radius:6px;font-weight:700;margin-bottom:12px}
 .list{background:#f8f9fb;border:1px solid var(--line);border-radius:6px;max-height:220px;overflow:auto;padding:8px;font-family:Consolas,monospace;font-size:11px;line-height:1.6}
 .result{white-space:pre-wrap;font-size:13px}
+.scaninfo{display:flex;align-items:center;gap:10px;flex:1;min-width:280px}
+.track{flex:1;height:8px;background:#e9edf2;border-radius:5px;overflow:hidden;max-width:420px}
+#scanfill{height:100%;width:0;background:var(--accent);transition:width .25s}
+#scantext{font-size:12px;color:var(--sub);white-space:nowrap}
+#scantext.done{color:#16a34a}#scantext.err{color:var(--danger)}
 </style></head><body>
 <header>
 <h1>微信图片 / 视频查看器 <span class="tag" id="keyinfo"></span></h1>
 <div class="bar">
   <div class="tabs"><button id="tab-image" class="on">图片分区</button><button id="tab-video">视频分区</button></div>
   <span class="tag" id="mode"></span>
+</div>
+<div class="bar" id="scanbar">
+  <button id="btn-rescan">重新扫描</button>
+  <div class="scaninfo"><span id="scantext">准备就绪</span><div class="track"><div id="scanfill"></div></div></div>
 </div>
 <div class="bar" id="bar-image"><span class="tag">会话</span><select id="sid" style="min-width:400px"></select></div>
 <div class="bar"><div class="months" id="months"></div></div>
@@ -687,12 +798,36 @@ async function init(){
   const k=await api('/api/status');ALLOW=k.allow_delete;
   $('keyinfo').textContent='密钥 '+k.key_desc+' · '+(ALLOW?'已启用删除（移入回收站）':'只读模式');
   $('mode').textContent=ALLOW?'删除需二次确认':'如需删除，重启时加 --allow-delete';
-  const ss=await api('/api/sessions');
-  $('sid').innerHTML=ss.map(s=>`<option value="${s.sid}">${s.last_date||'—'} → ${s.first_date||'—'} · ${s.size_mb} MB · ${s.file_count} 文件 · ${s.sid.slice(0,10)}…</option>`).join('');
   $('sid').onchange=()=>{SID=$('sid').value;showMonths()};
-  if(ss.length){SID=ss[0].sid}
   $('tab-image').onclick=()=>switchZone('image');$('tab-video').onclick=()=>switchZone('video');
-  showMonths();
+  $('btn-rescan').onclick=()=>startScan();
+  await startScan();
+}
+async function startScan(){
+  $('btn-rescan').disabled=true;
+  try{
+    const r=await post('/api/rescan',{});
+    if(!r.started){$('scantext').textContent=r.message||'扫描进行中…'}
+    await pollScan();
+  }catch(e){
+    $('scantext').textContent='启动扫描失败：'+e.message;
+    $('scantext').className='err';$('btn-rescan').disabled=false;
+  }
+}
+async function pollScan(){
+  const s=await api('/api/rescan/status');
+  const pct=s.total?Math.round(s.done/s.total*100):(s.finished?100:0);
+  $('scanfill').style.width=pct+'%';
+  $('scantext').textContent=s.message+(s.elapsed?` · ${s.elapsed}s`:'');
+  $('scantext').className=s.error?'err':(s.finished&&!s.running?'done':'');
+  if(s.running){setTimeout(pollScan,300);return}
+  $('btn-rescan').disabled=false;
+  if(s.error)return;
+  const ss=await api('/api/sessions');
+  const keep=SID;
+  $('sid').innerHTML=ss.map(s=>`<option value="${s.sid}">${s.first_date||'—'} → ${s.last_date||'—'} · ${fmt(s.size_bytes||s.size_mb*1048576)} · ${s.file_count} 文件 · ${s.sid.slice(0,10)}…</option>`).join('');
+  if(ss.length){SID=(keep&&ss.some(x=>x.sid===keep))?keep:ss[0].sid;$('sid').value=SID}
+  await showMonths();
 }
 function switchZone(z){
   ZONE=z;$('tab-image').classList.toggle('on',z==='image');$('tab-video').classList.toggle('on',z==='video');
@@ -840,6 +975,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"allow_delete": v.allow_delete, "key_desc": v.key_desc,
                             "xor_key": v.xor_key, "ffmpeg": str(v.ffmpeg) if v.ffmpeg else None,
                             "video_dir": str(v.video_dir)})
+            elif u.path == "/api/rescan/status":
+                self._json(v.scan_status())
             elif u.path == "/api/sessions":
                 self._json(v.sessions())
             elif u.path == "/api/months":
@@ -903,7 +1040,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._body()
             v = self.viewer
-            if self.path == "/api/export":
+            if self.path == "/api/rescan":
+                self._json(v.start_rescan())
+            elif self.path == "/api/export":
                 self._json(v.make_export(payload))
             elif self.path == "/api/delete/preview":
                 self._json(v.preview_delete(payload))

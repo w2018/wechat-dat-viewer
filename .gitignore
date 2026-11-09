@@ -3,6 +3,7 @@ __pycache__/
 exports/
 delete_log.jsonl
 wechat_data_root.dat
+sessions.csv
 *.dat
 *.zip
 *.jpg

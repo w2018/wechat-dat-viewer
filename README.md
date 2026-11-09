@@ -1,10 +1,16 @@
-# 微信 4.x 图片 / 视频查看器
+<div align="center">
 
-> 本地查看、导出、清理微信电脑版缓存的聊天图片与视频。零第三方依赖，默认只读。
+<h1>微信 4.x 图片 / 视频查看器</h1>
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![Dependencies](https://img.shields.io/badge/dependencies-none-green)
-![Mode](https://img.shields.io/badge/mode-local%20only-lightgrey)
+<p>本地查看、导出、清理微信电脑版缓存的聊天图片与视频。零第三方依赖，默认只读。</p>
+
+<p>
+  <img src="https://img.shields.io/badge/Python-3.10%2B-blue" alt="Python">
+  <img src="https://img.shields.io/badge/dependencies-none-green" alt="Dependencies">
+  <img src="https://img.shields.io/badge/mode-local_only-lightgrey" alt="Mode">
+</p>
+
+</div>
 
 ---
 
@@ -26,19 +32,21 @@
 ## Features
 
 - **双分区**：图片分区按会话 + 月份解密看图；视频分区按月份播放明文 MP4（支持拖动）。
+- **自动发现数据目录**：读注册表记录的路径、常见位置与各盘根目录找到微信 4.x 数据目录，结果保存到 `wechat_data_root.dat`。
+- **重新扫描**：顶部按钮强制重扫全部会话的大小、文件数与日期；首次加载与重新扫描都显示进度条、耗时和完成状态（后台线程，不阻塞界面）。
 - **勾选统计**：实时显示已选数量与总大小，按整组文件（高清图 / 缩略图 / 封面）累加。
-- **悬浮信息**：路径、日期时间、大小、像素尺寸、时长、硬链接标记。
+- **悬浮信息**：路径、日期时间、大小（自动 KB / MB / GB）、像素尺寸、时长、硬链接标记。
 - **批量导出**：打包 ZIP 到 `exports/`，绝不写回微信目录。
 - **批量删除**：默认关闭，需显式开启；两步确认后分批移入系统回收站。
+- **降级提示**：整组都解不出或视频无法播放时才显示简洁占位图，不出现破图；`wxgf` 高清原图缺 ffmpeg 时悬浮信息标注「原图需 ffmpeg」，缩略图照常显示。
 - **零依赖 / 本地**：纯 Python AES，服务只绑定 `127.0.0.1`，看图与播放走内存响应。
-- **降级提示**：无法预览或播放的格式显示简洁占位图（如「不支持预览，需要 ffmpeg」），不出现破图。
 
 ## Requirements
 
 - Windows + Python 3.10+（仅标准库）
-- 微信电脑版 4.x 的本地数据目录：**启动时自动扫描**（注册表记录的路径、常见位置、各盘根目录）；也可手动用 `--data-root` 或环境变量 `WECHAT_DATA_ROOT` 指定
-- 扫描结果保存在当前文件夹的 `wechat_data_root.dat`，下次直接复用；该文件已被 `.gitignore` 排除，不会提交
-- 可选：**完整版** ffmpeg（需含 HEVC demuxer 与 MJPEG encoder），用于显示 `wxgf` 图片；放到 PATH 或用 `--ffmpeg` / `WECHAT_FFMPEG` 指定。未配置时这类图片显示「不支持预览，需要 ffmpeg」占位图；工具不会自动扫描 ffmpeg 安装位置
+- 微信电脑版 4.x 的本地数据目录：启动时自动扫描；也可用 `--data-root` 或环境变量 `WECHAT_DATA_ROOT` 指定
+- 扫描结果保存在当前文件夹的 `wechat_data_root.dat`，下次直接复用；该文件已被 `.gitignore` 排除
+- 可选：**完整版** ffmpeg（需含 HEVC demuxer 与 MJPEG encoder），用于解码 `wxgf` 高清原图；放到 PATH 或用 `--ffmpeg` / `WECHAT_FFMPEG` 指定。未配置时按「高清图 → 主图 → 缩略图」回退，明文 JPEG 缩略图仍可正常显示。工具不会自动扫描 ffmpeg 安装位置
 
 ## Quick Start
 
@@ -49,7 +57,7 @@ python wechat_dat_viewer.py probe
 # 2) 启动（默认端口 56789）
 python wechat_dat_viewer.py serve --open
 
-# 若自动扫描没找到，手动指定一次即可（同样会写入 .dat 配置）
+# 若自动扫描没找到，手动指定一次即可
 python wechat_dat_viewer.py probe --data-root "D:\YourPath\xwechat_files"
 # 或：set WECHAT_DATA_ROOT=D:\YourPath\xwechat_files
 ```
@@ -75,14 +83,14 @@ python wechat_dat_viewer.py export \
 | 查看 | 灯箱看原图，优先 `_h.dat` 高清 | 灯箱播放，HTTP 206 Range |
 | 卡片 | 文件名前缀 + 大小 | 同左 |
 
-会话下拉框按最新日期倒序，选项显示起止年月日、占用大小与文件数。若提供 `--sessions-csv`（列名 `session_hash,logical_size_MB,file_count`），可显示更精确的占用数据。
+会话下拉框按最近活动日期倒序，选项按「起始 → 结束」显示起止年月日、占用大小（自动换算 KB / MB / GB）与文件数。**占用与文件数在 CSV 缺失时自动实时扫描文件系统**（只读遍历，结果缓存在内存、不落盘，298 个会话约 1 秒）；也可用 `--sessions-csv` 提供预生成清单（列名 `session_hash,logical_size_MB,file_count`）。清单文件含真实会话哈希，已由 `.gitignore` 排除，不要提交。
 
 删除链路：`preview` 生成完整文件清单 + 一次性令牌 → 前端手工输入 `MOVE_TO_RECYCLE_BIN` → `commit` 校验令牌与确认词 → 每批 ≤10 个经 `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站，逐批验证、失败即停，并写 `delete_log.jsonl`。数据库与配置文件一律拒绝操作。硬链接文件删除后不一定立刻释放空间，需清空回收站才真正腾出磁盘。
 
 ## 技术实现
 
 - 图片 `.dat` 为微信 4.0 的 V2 格式：15B 头 `07 08 56 32 08 07` + AES-128-ECB 段（PKCS#7）+ 单字节 XOR 尾段。密钥可纯离线推导：AES key = `MD5(UIN + wxid)[:16]`，XOR key = `UIN & 0xFF`，UIN 取自 `%APPDATA%\Tencent\xwechat\net\kvcomm\key_<uin>_*.statistic` 文件名。实现为纯 Python，已与 OpenSSL 交叉验证。
-- 部分图片是微信自研 `wxgf`（内部 Annex-B HEVC），工具从 VPS 起始码 `00 00 00 01 40 01` 截取 HEVC 流，用完整版 ffmpeg 在内存里取首帧转 JPEG；精简版 ffmpeg 缺少相应 demuxer/encoder 时这部分图片无法预览。
+- 部分图片是微信自研 `wxgf`（内部 Annex-B HEVC），完整版 ffmpeg 可从 VPS 起始码 `00 00 00 01 40 01` 截取 HEVC 流并在内存中转成 JPEG；缺 ffmpeg 时自动回退到组内可解出的 JPEG（高清图或缩略图），悬浮信息标注「原图需 ffmpeg」。
 - 视频为明文 MP4；分辨率与时长由 MP4 容器头（`mvhd` / `stsd`）解析，无需 ffprobe。
 - 视频按月份全局存放，**无法按群管理**；按群清理请用微信自带的「设置 → 存储空间管理 → 聊天数据管理」。
 
@@ -96,22 +104,35 @@ wechat-dat-viewer/
 ├── start_viewer_delete.bat     # 带删除启动
 ├── .gitignore
 ├── LICENSE
-├── README.md
-└── wechat_data_root.dat      # 运行时生成，记录数据目录，已忽略
+└── README.md
 ```
 
-`exports/`、`delete_log.jsonl` 与 `wechat_data_root.dat` 都在运行时生成，已被 `.gitignore` 排除。
+`exports/`、`delete_log.jsonl` 与 `wechat_data_root.dat` 在运行时生成，均已被 `.gitignore` 排除。
+
+## 更新日志
+
+### v0.2.0
+
+- 会话占用与文件数不再依赖外部 CSV：缺失时实时扫描文件系统，结果缓存在内存
+- 新增「重新扫描」按钮与进度条、耗时、完成状态；首次加载也走同一后台扫描流程
+- 下拉框日期改为「起始 → 结束」，大小自动换算 KB / MB / GB
+- 修正 `wxgf` 误判：缩略图与大图按「高清 → 主图 → 缩略图」回退正常显示，悬浮信息标注「原图需 ffmpeg」
+- README 顶部区域居中，徽标改回可正确渲染的路径形式
+
+### v0.1.0
+
+- 初始发布：双分区看图 / 播放、勾选统计、悬浮信息、批量导出、两步确认删除（系统回收站）、自动发现数据目录、MIT 许可证
 
 ## FAQ
 
-- **出现「不支持预览，需要 ffmpeg」**：安装完整版 ffmpeg 后用 `--ffmpeg` 或 `WECHAT_FFMPEG` 指定；工具不会自动扫描 ffmpeg。
+- **悬浮信息显示「原图需 ffmpeg」**：缩略图和大图仍可看（回退到明文 JPEG），只是 `wxgf` 高清原图解码不了；安装完整版 ffmpeg 后用 `--ffmpeg` 或 `WECHAT_FFMPEG` 指定即可。
 - **视频出现「不支持播放，需要解码器」**：浏览器无法解码该编码，可用系统播放器打开导出的 MP4。
-- **提示「未找到微信 4.x 数据目录」**：确认微信 PC 版登录过并生成了 `xwechat_files`；用 `--data-root` 指定一次，或设置 `WECHAT_DATA_ROOT`。扫描会读注册表里微信记录的文件保存路径，再试常见目录与各盘根目录。
-- **换了数据目录 / 迁移了微信文件**：删掉当前文件夹的 `wechat_data_root.dat` 再启动，或直接用 `--data-root` 覆盖并重写配置。
+- **提示「未找到微信 4.x 数据目录」**：确认微信 PC 版登录过并生成了 `xwechat_files`；用 `--data-root` 指定一次，或设置 `WECHAT_DATA_ROOT`。
+- **换了数据目录 / 迁移了微信文件**：删掉当前文件夹的 `wechat_data_root.dat` 再启动，或用 `--data-root` 覆盖并重写配置。
 - **Python 启动报 `SRE module mismatch`**：`PYTHONHOME` 指向了损坏的解释器，先清空该环境变量；启动器已处理。
-- **图片打不开**：跑 `probe` 检查密钥；`wxgf` 格式需确认完整版 ffmpeg 可用。
+- **图片打不开**：先跑 `probe` 检查密钥；`wxgf` 高清原图需完整版 ffmpeg，缩略图通常仍可显示。
 - **删了空间没变**：硬链接仍被别处引用，或文件还在回收站占空间。
-- **找不到占用最大的群**：下拉框按日期倒序，可按选项里的 MB 数值识别；也可自行提供按大小排序的 `--sessions-csv`。
+- **找不到占用最大的群**：下拉框按最近活动日期倒序，可按选项里自动换算的大小数值识别；也可提供按大小排序的 `--sessions-csv`。
 
 ## 只读承诺
 
