@@ -1,10 +1,17 @@
 #!/usr/bin/env python
 """
-wechat_dat_viewer.py — 微信 4.x 图片/视频查看器（零第三方依赖，双分区）
+wechat_dat_viewer.py — 微信 4.x 图片/视频查看器（零第三方依赖，双分区）v0.3.0
 
 默认只读：
   * 微信目录只用 open(..., 'rb') 读取；看图/播放走内存 HTTP 响应，不落盘。
-  * 不打开消息数据库、不解析聊天文本；HTTP 只绑定 127.0.0.1。
+  * 不打开消息数据库、不解析聊天文本；HTTP 默认只绑定 127.0.0.1。
+
+Web 访问（v0.3.0 起）：
+  * 页面入口只挂在 /wx，/ 与 /index.html 返回 404、不跳转不提示；
+  * 首次打开引导设置访问密码（>=6 位），PBKDF2 加盐哈希存同级 wechat_viewer_key.json；
+  * 除登录/设置页外，所有 /api/* 都校验会话；
+  * 同一 IP 30 秒内连续输错 3 次，封禁 10 分钟；计数与会话只在内存，重启清零。
+  * 手机访问用 --host 0.0.0.0；首次设置密码仅允许本机(127.0.0.1)完成。
 
 需要删除能力时必须显式加 --allow-delete，且：
   1) 先 POST /api/delete/preview 得到完整文件清单 + 一次性令牌；
@@ -15,14 +22,17 @@ wechat_dat_viewer.py — 微信 4.x 图片/视频查看器（零第三方依赖�
 
 用法：
   python wechat_dat_viewer.py probe
-  python wechat_dat_viewer.py serve --port 56789 [--allow-delete] [--open]
+  python wechat_dat_viewer.py serve [--port 56789] [--host 0.0.0.0] [--allow-delete] [--open]
   python wechat_dat_viewer.py export --session <hash> --month 2026-09 --out <目录> [--limit 50]
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -63,11 +73,21 @@ from wechat_dat_core import (  # noqa: E402
     wxgf_to_jpeg,
 )
 
+from wechat_viewer_ui import auth_page, build_page  # noqa: E402
+
 DEFAULT_CSV = TOOL_DIR / "sessions.csv"
 DEFAULT_EXPORT = TOOL_DIR / "exports" / "images"
 EXPORT_DIR = TOOL_DIR / "exports"
 DELETE_LOG = TOOL_DIR / "delete_log.jsonl"
 CONFIG_FILE = TOOL_DIR / "wechat_data_root.dat"   # 运行时生成，已被 .gitignore 排除
+APP_VERSION = "0.3.0"
+KEY_FILE = TOOL_DIR / "wechat_viewer_key.json"    # 访问密码（PBKDF2 哈希），已被 .gitignore 排除
+
+SESSION_COOKIE = "wv_session"
+SESSION_TTL = 12 * 3600        # 登录状态保留 12 小时
+MAX_FAILS = 3                  # 30 秒内连续错误次数上限
+FAIL_WINDOW = 30.0             # 错误计数滑动窗口（秒）
+BAN_SECONDS = 600              # 封禁时长 10 分钟
 
 
 def load_saved_root() -> Path | None:
@@ -127,6 +147,151 @@ def placeholder_svg(text: str) -> bytes:
         + escape(text) + "</text></svg>"
     )
     return svg.encode("utf-8")
+
+
+# ------------------------------------------------------------------ 登录认证 ---
+
+def is_mobile_ua(ua: str) -> bool:
+    """按 UA 粗判手机/平板，用于选择移动端界面。"""
+    return bool(re.search(r"(Mobile|Android|iPhone|iPod|iPad|HarmonyOS|MicroMessenger|Mobile Safari)",
+                          ua or "", re.I))
+
+
+def hash_password(password: str, salt: bytes | None = None) -> dict:
+    salt = salt or secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return {
+        "algo": "pbkdf2_sha256",
+        "iterations": 200_000,
+        "salt": base64.b64encode(salt).decode(),
+        "hash": base64.b64encode(dk).decode(),
+    }
+
+
+class Auth:
+    """Web 访问密码：key 文件存 PBKDF2 哈希；会话与 IP 封禁只放内存。
+
+    * 密码不落明文，key 文件仅程序目录可读（尽量 chmod 600）。
+    * 30 秒滑动窗口内连续输错 3 次 → 该 IP 封禁 10 分钟。
+    * 会话/封禁均不持久化，重启即清零（避免把自己永久锁死）。
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.lock = threading.RLock()
+        self.sessions: dict[str, float] = {}
+        self.fails: dict[str, list[float]] = {}
+        self.bans: dict[str, float] = {}
+        self.record: dict | None = None
+        self._load()
+
+    # -- key 文件 ---------------------------------------------------------
+    def _load(self) -> None:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.record = None
+            return
+        if isinstance(raw, dict) and raw.get("hash") and raw.get("salt"):
+            self.record = raw
+        else:
+            print(f"警告：{self.path} 格式不正确，已忽略（将要求重新设置密码）", file=sys.stderr)
+            self.record = None
+
+    @property
+    def configured(self) -> bool:
+        return self.record is not None
+
+    def set_password(self, password: str) -> None:
+        pwd = (password or "").strip()
+        if len(pwd) < 6:
+            raise ValueError("密码至少 6 位")
+        rec = hash_password(pwd)
+        rec["created"] = datetime.now().isoformat(timespec="seconds")
+        assert_output_path(self.path)
+        self.path.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        with self.lock:
+            self.record = rec
+            self.sessions.clear()
+            self.fails.clear()
+            self.bans.clear()
+
+    def verify(self, password: str) -> bool:
+        rec = self.record
+        if not rec:
+            return False
+        try:
+            salt = base64.b64decode(rec["salt"])
+            want = base64.b64decode(rec["hash"])
+            it = int(rec.get("iterations") or 200_000)
+        except (KeyError, ValueError, TypeError):
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt, it)
+        return hmac.compare_digest(got, want)
+
+    # -- 会话 -------------------------------------------------------------
+    def new_session(self) -> str:
+        token = secrets.token_urlsafe(32)
+        with self.lock:
+            self.sessions[token] = time.time() + SESSION_TTL
+        return token
+
+    def valid_session(self, token: str | None) -> bool:
+        if not token:
+            return False
+        with self.lock:
+            exp = self.sessions.get(token)
+            if not exp:
+                return False
+            if exp < time.time():
+                self.sessions.pop(token, None)
+                return False
+            return True
+
+    def revoke(self, token: str | None) -> None:
+        if not token:
+            return
+        with self.lock:
+            self.sessions.pop(token, None)
+
+    # -- 失败计数 / 封禁 ---------------------------------------------------
+    def ban_left(self, ip: str) -> int:
+        with self.lock:
+            until = self.bans.get(ip, 0.0)
+            left = int(until - time.time())
+            if left > 0:
+                return left
+            self.bans.pop(ip, None)
+            return 0
+
+    def attempts_left(self, ip: str) -> int:
+        now = time.time()
+        with self.lock:
+            arr = [t for t in self.fails.get(ip, []) if now - t <= FAIL_WINDOW]
+            self.fails[ip] = arr
+            return max(0, MAX_FAILS - len(arr))
+
+    def note_failure(self, ip: str) -> int:
+        """记录一次密码错误；触发封禁时返回封禁秒数，否则 0。"""
+        now = time.time()
+        with self.lock:
+            arr = [t for t in self.fails.get(ip, []) if now - t <= FAIL_WINDOW]
+            arr.append(now)
+            self.fails[ip] = arr
+            if len(arr) >= MAX_FAILS:
+                self.bans[ip] = now + BAN_SECONDS
+                self.fails[ip] = []
+                return BAN_SECONDS
+            return 0
+
+    def clear_failure(self, ip: str) -> None:
+        with self.lock:
+            self.fails.pop(ip, None)
+            self.bans.pop(ip, None)
 
 
 SID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -702,242 +867,11 @@ class Viewer:
 
 # ------------------------------------------------------------------- HTML ---
 
-PAGE = r"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<title>微信图片 / 视频查看器</title>
-<style>
-:root{--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--text:#1f2329;--sub:#6b7280;--accent:#2563eb;--danger:#dc2626}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);padding:10px 20px}
-h1{font-size:16px;margin:0 0 8px;font-weight:600}
-.tabs{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-right:12px}
-.tabs button{border:0;border-radius:0;padding:6px 16px;background:#fff}
-.tabs button.on{background:var(--accent);color:#fff}
-.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
-select,button,input{font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text)}
-button{cursor:pointer}button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
-button:disabled{opacity:.45;cursor:not-allowed}
-button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
-button.danger{color:var(--danger);border-color:#f3c2c2}
-.tag{color:var(--sub);font-size:12px}
-.stat{font-weight:600;color:var(--accent)}
-main{padding:14px 20px 40px}
-.months{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
-.months button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
-.cell{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden;position:relative;cursor:zoom-in}
-.cell.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.18)}
-.cell img{width:100%;height:140px;object-fit:cover;display:block;background:#eef0f3}
-.cell .meta{padding:6px 8px;font-size:11px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.cell .chk{position:absolute;top:6px;left:6px;width:18px;height:18px;cursor:pointer;accent-color:var(--accent)}
-.cell .play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
-.cell .play span{background:rgba(0,0,0,.55);color:#fff;border-radius:50%;width:34px;height:34px;display:flex;align-items:center;justify-content:center;font-size:14px}
-.more{display:block;margin:20px auto;padding:8px 24px}
-.empty{color:var(--sub);padding:40px;text-align:center}
-#tip{display:none;position:fixed;z-index:30;max-width:460px;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.16);padding:10px 12px;font-size:12px;line-height:1.7;pointer-events:none;word-break:break-all}
-#tip b{color:var(--text)}#tip .k{color:var(--sub);display:inline-block;min-width:64px}
-#box{display:none;position:fixed;inset:0;background:rgba(15,20,30,.92);z-index:20;align-items:center;justify-content:center;flex-direction:column}
-#box.on{display:flex}#box img,#box video{max-width:94vw;max-height:84vh;object-fit:contain;background:#000}
-#box .cap{color:#dbe2ea;margin-top:10px;font-size:12px}
-#box .close{position:absolute;top:16px;right:20px;color:#fff;background:none;border:1px solid #6b7280;font-size:16px;padding:4px 12px}
-#modal{display:none;position:fixed;inset:0;background:rgba(15,20,30,.6);z-index:40;align-items:center;justify-content:center;padding:20px}
-#modal.on{display:flex}
-.dialog{background:#fff;border-radius:10px;width:min(760px,96vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}
-.dialog h2{font-size:16px;margin:0;padding:14px 18px;border-bottom:1px solid var(--line)}
-.dialog .body{padding:14px 18px;overflow:auto}
-.dialog .foot{padding:12px 18px;border-top:1px solid var(--line);display:flex;gap:10px;justify-content:flex-end;align-items:center}
-.warn{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;padding:10px 12px;border-radius:6px;font-weight:700;margin-bottom:12px}
-.list{background:#f8f9fb;border:1px solid var(--line);border-radius:6px;max-height:220px;overflow:auto;padding:8px;font-family:Consolas,monospace;font-size:11px;line-height:1.6}
-.result{white-space:pre-wrap;font-size:13px}
-.scaninfo{display:flex;align-items:center;gap:10px;flex:1;min-width:280px}
-.track{flex:1;height:8px;background:#e9edf2;border-radius:5px;overflow:hidden;max-width:420px}
-#scanfill{height:100%;width:0;background:var(--accent);transition:width .25s}
-#scantext{font-size:12px;color:var(--sub);white-space:nowrap}
-#scantext.done{color:#16a34a}#scantext.err{color:var(--danger)}
-</style></head><body>
-<header>
-<h1>微信图片 / 视频查看器 <span class="tag" id="keyinfo"></span></h1>
-<div class="bar">
-  <div class="tabs"><button id="tab-image" class="on">图片分区</button><button id="tab-video">视频分区</button></div>
-  <span class="tag" id="mode"></span>
-</div>
-<div class="bar" id="scanbar">
-  <button id="btn-rescan">重新扫描</button>
-  <div class="scaninfo"><span id="scantext">准备就绪</span><div class="track"><div id="scanfill"></div></div></div>
-</div>
-<div class="bar" id="bar-image"><span class="tag">会话</span><select id="sid" style="min-width:400px"></select></div>
-<div class="bar"><div class="months" id="months"></div></div>
-<div class="bar">
-  <label class="tag"><input type="checkbox" id="selall"> 全选本页</label>
-  <span class="stat" id="selstat">已选 0 项 · 0 MB</span>
-  <button id="btn-export" class="primary">导出勾选</button>
-  <button id="btn-delete" class="danger">删除勾选（移入回收站）</button>
-  <span class="tag" id="stat"></span>
-</div>
-</header>
-<main><div class="grid" id="grid"></div><button class="more" id="more" style="display:none">加载更多</button><div class="empty" id="empty">正在加载…</div></main>
-<div id="tip"></div>
-<div id="box"><button class="close" onclick="closeBox()">关闭 ×</button><img id="big" style="display:none"><video id="vid" controls style="display:none" onerror="videoError()"></video><div class="cap" id="cap"></div></div>
-<div id="modal"><div class="dialog"><h2 id="mtitle">确认操作</h2><div class="body" id="mbody"></div><div class="foot" id="mfoot"></div></div></div>
-<script>
-let ZONE='image',SID='',MONTH='',OFFSET=0,LIMIT=120,TOTAL=0,ALLOW=false,PENDING=null;
-const SEL=new Set(), INFO={};
-const $=id=>document.getElementById(id);
-function fmt(n){return n>=1073741824?(n/1073741824).toFixed(2)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(0)+' KB'}
-async function api(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error((await r.text()).slice(0,300));return r.json()}
-function post(u,obj){return api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)})}
-function stub(){return{zone:ZONE,sid:SID,month:MONTH,bases:[...SEL]}}
-function updateStat(){
-  let n=0,s=0;for(const b of SEL){const it=ITEMS.find(x=>x.base===b);if(it){n++;s+=it.size}}
-  $('selstat').textContent=`已选 ${n} 项 · ${fmt(s)}`;
-  $('btn-export').disabled=n===0;$('btn-delete').disabled=n===0||!ALLOW;
-}
-let ITEMS=[];
-async function init(){
-  const k=await api('/api/status');ALLOW=k.allow_delete;
-  $('keyinfo').textContent='密钥 '+k.key_desc+' · '+(ALLOW?'已启用删除（移入回收站）':'只读模式');
-  $('mode').textContent=ALLOW?'删除需二次确认':'如需删除，重启时加 --allow-delete';
-  $('sid').onchange=()=>{SID=$('sid').value;showMonths()};
-  $('tab-image').onclick=()=>switchZone('image');$('tab-video').onclick=()=>switchZone('video');
-  $('btn-rescan').onclick=()=>startScan();
-  await startScan();
-}
-async function startScan(){
-  $('btn-rescan').disabled=true;
-  try{
-    const r=await post('/api/rescan',{});
-    if(!r.started){$('scantext').textContent=r.message||'扫描进行中…'}
-    await pollScan();
-  }catch(e){
-    $('scantext').textContent='启动扫描失败：'+e.message;
-    $('scantext').className='err';$('btn-rescan').disabled=false;
-  }
-}
-async function pollScan(){
-  const s=await api('/api/rescan/status');
-  const pct=s.total?Math.round(s.done/s.total*100):(s.finished?100:0);
-  $('scanfill').style.width=pct+'%';
-  $('scantext').textContent=s.message+(s.elapsed?` · ${s.elapsed}s`:'');
-  $('scantext').className=s.error?'err':(s.finished&&!s.running?'done':'');
-  if(s.running){setTimeout(pollScan,300);return}
-  $('btn-rescan').disabled=false;
-  if(s.error)return;
-  const ss=await api('/api/sessions');
-  const keep=SID;
-  $('sid').innerHTML=ss.map(s=>`<option value="${s.sid}">${s.first_date||'—'} → ${s.last_date||'—'} · ${fmt(s.size_bytes||s.size_mb*1048576)} · ${s.file_count} 文件 · ${s.sid.slice(0,10)}…</option>`).join('');
-  if(ss.length){SID=(keep&&ss.some(x=>x.sid===keep))?keep:ss[0].sid;$('sid').value=SID}
-  await showMonths();
-}
-function switchZone(z){
-  ZONE=z;$('tab-image').classList.toggle('on',z==='image');$('tab-video').classList.toggle('on',z==='video');
-  $('bar-image').style.display=z==='image'?'flex':'none';
-  SEL.clear();ITEMS=[];showMonths();
-}
-async function showMonths(){
-  const ms=ZONE==='image'?(SID?await api('/api/months?sid='+SID):[]):await api('/api/video_months');
-  $('months').innerHTML=ms.map(m=>`<button data-m="${m}">${m}</button>`).join('');
-  [...$('months').children].forEach(b=>b.onclick=()=>{MONTH=b.dataset.m;[...$('months').children].forEach(x=>x.classList.remove('on'));b.classList.add('on');load(true)});
-  if(ms.length){MONTH=ms[ms.length-1];$('months').lastChild.classList.add('on');load(true)}else{reset('该分区没有内容')}
-}
-function reset(msg){$('grid').innerHTML='';ITEMS=[];$('more').style.display='none';$('empty').textContent=msg;$('empty').style.display='block';$('stat').textContent='';SEL.clear();updateStat()}
-async function load(fresh){
-  if(fresh){OFFSET=0;$('grid').innerHTML='';ITEMS=[];SEL.clear()}
-  const u=ZONE==='image'?`/api/images?sid=${SID}&month=${MONTH}&offset=${OFFSET}&limit=${LIMIT}`:`/api/videos?month=${MONTH}&offset=${OFFSET}&limit=${LIMIT}`;
-  const d=await api(u);TOTAL=d.total;ITEMS=ITEMS.concat(d.items);
-  $('empty').style.display=TOTAL?'none':'block';
-  if(!TOTAL){reset('该月份没有内容');return}
-  d.items.forEach(it=>{
-    const c=document.createElement('div');c.className='cell';c.dataset.base=it.base;
-    const src=ZONE==='image'?`/api/img?sid=${SID}&month=${MONTH}&base=${encodeURIComponent(it.base)}&kind=thumb`:`/api/video_thumb?month=${MONTH}&base=${encodeURIComponent(it.base)}`;
-    c.innerHTML=`<input type="checkbox" class="chk" ${SEL.has(it.base)?'checked':''}><img loading="lazy" src="${src}" alt=""><div class="meta">${it.base.slice(0,10)} · ${fmt(it.size)}${it.has_hd?' · 有原图':''}</div>${ZONE==='video'?'<div class="play"><span>▶</span></div>':''}`;
-    c.querySelector('.chk').onclick=e=>{e.stopPropagation();if(e.target.checked)SEL.add(it.base);else SEL.delete(it.base);c.classList.toggle('sel',e.target.checked);updateStat()};
-    c.onclick=()=>openBox(it);
-    c.onmouseenter=e=>showTip(it.base,e);c.onmousemove=moveTip;c.onmouseleave=hideTip;
-    $('grid').appendChild(c);
-  });
-  OFFSET+=d.items.length;
-  $('stat').textContent=`${MONTH} · 共 ${TOTAL} 项 · 已显示 ${OFFSET} 项`;
-  $('more').style.display=OFFSET<TOTAL?'block':'none';
-  $('selall').checked=false;updateStat();
-}
-async function showTip(base,e){
-  const key=ZONE+'|'+SID+'|'+MONTH+'|'+base;
-  let m=INFO[key];
-  if(!m){
-    m=await api(`/api/info?zone=${ZONE}&sid=${SID}&month=${MONTH}&base=${encodeURIComponent(base)}`);INFO[key]=m;
-  }
-  const dim=m.width?`${m.width} × ${m.height}`:'未知';
-  const dur=m.duration?`${m.duration} 秒`:'—';
-  const rows=m.files.map(f=>`<div><span class="k">路径</span><b>${f.path}</b><br><span class="k">日期时间</span>${f.mtime_str}　<span class="k">大小</span>${fmt(f.size)}${f.nlink>1?'　<span style="color:#dc2626">硬链接 '+f.nlink+'</span>':''}</div>`).join('<hr style="border:0;border-top:1px solid #eee">');
-  $('tip').innerHTML=`<div><span class="k">分区</span><b>${ZONE==='image'?'图片':'视频'}</b>　<span class="k">格式</span><b>${m.format}</b></div><div><span class="k">像素尺寸</span><b>${dim}</b>　<span class="k">时长</span>${dur}　<span class="k">合计</span>${fmt(m.total_size)}</div><hr style="border:0;border-top:1px solid #eee">${rows}`;
-  $('tip').style.display='block';moveTip(e);
-}
-function moveTip(e){const t=$('tip');const x=Math.min(e.clientX+16,innerWidth-480),y=Math.min(e.clientY+16,innerHeight-260);t.style.left=Math.max(8,x)+'px';t.style.top=Math.max(8,y)+'px'}
-function hideTip(){$('tip').style.display='none'}
-function openBox(it){
-  $('box').classList.add('on');
-  if(ZONE==='image'){
-    $('vid').style.display='none';$('vid').pause();$('big').style.display='block';
-    $('big').src=`/api/img?sid=${SID}&month=${MONTH}&base=${encodeURIComponent(it.base)}&kind=full`;
-  }else{
-    $('big').style.display='none';$('vid').style.display='block';
-    $('vid').src=`/api/video_stream?month=${MONTH}&base=${encodeURIComponent(it.base)}`;$('vid').play().catch(()=>{});
-  }
-  $('cap').textContent=`${it.base} · ${fmt(it.size)}`;
-}
-function closeBox(){$('box').classList.remove('on');$('big').src='';$('vid').pause();$('vid').src=''}
-function videoError(){
-  if(!$('box').classList.contains('on'))return;
-  $('vid').style.display='none';$('big').style.display='block';
-  $('big').src='/api/placeholder?text='+encodeURIComponent('不支持播放，需要解码器');
-  $('cap').textContent='不支持播放，需要解码器';
-}
-function modal(title,body,foot){$('mtitle').textContent=title;$('mbody').innerHTML=body;$('mfoot').innerHTML='';foot.forEach(h=>{$('mfoot').appendChild(h)});$('modal').classList.add('on')}
-function closeModal(){$('modal').classList.remove('on');PENDING=null}
-function btn(text,cls,fn){const b=document.createElement('button');b.textContent=text;b.className=cls||'';b.onclick=fn;return b}
-$('selall').onchange=e=>{
-  [...$('grid').children].forEach(c=>{const b=c.dataset.base;if(e.target.checked)SEL.add(b);else SEL.delete(b);c.classList.toggle('sel',e.target.checked);c.querySelector('.chk').checked=e.target.checked});updateStat();
-};
-$('more').onclick=()=>load(false);
-$('btn-export').onclick=async()=>{
-  if(!SEL.size)return;
-  try{
-    const r=await post('/api/export',stub());
-    modal('导出完成',`<div class="result">已导出 ${r.count} 个文件\nZIP：${r.path}\n大小：${fmt(r.bytes)}</div>`,[btn('下载 ZIP','primary',()=>location.href='/api/download?name='+encodeURIComponent(r.name)),btn('关闭','',closeModal)]);
-  }catch(e){modal('导出失败',`<div class="result">${e.message}</div>`,[btn('关闭','',closeModal)])}
-};
-$('btn-delete').onclick=async()=>{
-  if(!SEL.size||!ALLOW)return;
-  try{
-    const p=await post('/api/delete/preview',stub());PENDING=p.token;
-    const list=p.files.map(f=>`${f.path}　(${fmt(f.size)})`).join('<br>');
-    const body=`<div class="warn">⚠️ ${p.warning}</div>
-      <div class="result">分组 <b>${p.group_count}</b> 项，实际文件 <b>${p.file_count}</b> 个，合计 <b>${fmt(p.total_size)}</b>${p.hardlinked_files?`<br><span style="color:#dc2626">其中 ${p.hardlinked_files} 个是硬链接文件，删除后不一定立刻释放空间</span>`:''}</div>
-      <div class="list" style="margin:10px 0">${list}</div>
-      <div>请输入 <b>${p.confirm_word}</b> 完成二次确认：<br><input id="cword" style="width:320px;margin-top:6px" autocomplete="off" placeholder="手工输入确认词"></div>`;
-    modal('删除前确认（第一步：清单与风险）',body,[
-      btn('取消','',closeModal),
-      btn('第二步：移入回收站','danger',async()=>{
-        const w=$('cword').value.trim();
-        if(w!==p.confirm_word){alert('确认词不正确，未执行任何删除');return}
-        try{
-          const r=await post('/api/delete/commit',{token:p.token,confirm:w});
-          load(true);
-          modal('删除结果',`<div class="result">已移入回收站：${r.deleted} 个文件（${r.batches} 批）\n失败：${r.failed} 个${r.stopped_early?'\n已中止剩余批次':''}\n日志：${r.log}\n\n可从系统回收站还原。</div>`,[btn('关闭','',closeModal)]);
-        }catch(e){modal('删除失败',`<div class="result">${e.message}</div>`,[btn('关闭','',closeModal)])}
-      })
-    ]);
-  }catch(e){modal('无法预览删除',`<div class="result">${e.message}</div>`,[btn('关闭','',closeModal)])}
-};
-$('box').onclick=e=>{if(e.target.id==='box')closeBox()};
-document.onkeydown=e=>{if(e.key==='Escape'){closeBox();closeModal()}};
-init().catch(e=>reset('加载失败：'+e.message));
-</script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
     viewer: Viewer
+    auth: Auth
 
     def log_message(self, fmt, *args):
         if "/api/img" not in (self.path or "") and "/api/video_" not in (self.path or ""):
@@ -956,21 +890,114 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _json(self, obj, code: int = 200):
+    def _json(self, obj, code: int = 200, extra=None):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
-                   "application/json; charset=utf-8")
+                   "application/json; charset=utf-8", extra=extra)
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+
+    # -- 认证辅助 ---------------------------------------------------------
+    def _ip(self) -> str:
+        return self.client_address[0]
+
+    def _is_local(self) -> bool:
+        return self._ip() in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _cookies(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            if "=" in part:
+                k, val = part.split("=", 1)
+                out[k.strip()] = val.strip()
+        return out
+
+    def _token(self) -> str | None:
+        return self._cookies().get(SESSION_COOKIE)
+
+    def _authed(self) -> bool:
+        return self.auth.valid_session(self._token())
+
+    def _guard(self) -> bool:
+        """未登录时直接回 401 并返回 True；已登录返回 False。"""
+        if self._authed():
+            return False
+        if not self.auth.configured:
+            self._json({"error": "尚未设置访问密码", "need_setup": True}, 401)
+        else:
+            self._json({"error": "未登录或登录已过期", "need_login": True}, 401)
+        return True
+
+    def _set_cookie(self, token: str, max_age: int = SESSION_TTL) -> dict:
+        return {"Set-Cookie": f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"}
+
+    def _do_login(self) -> None:
+        payload = self._body()
+        ip = self._ip()
+        left = self.auth.ban_left(ip)
+        if left > 0:
+            self._json({"error": f"尝试次数过多，请在 {left // 60} 分 {left % 60} 秒后重试",
+                        "retry_after": left}, 429)
+            return
+        if self.auth.verify(str(payload.get("password", ""))):
+            self.auth.clear_failure(ip)
+            token = self.auth.new_session()
+            self._json({"ok": True}, 200, self._set_cookie(token))
+            return
+        ban = self.auth.note_failure(ip)
+        if ban:
+            self._json({"error": "30 秒内连续输错 3 次，已禁止该 IP 访问 10 分钟", "retry_after": ban}, 429)
+        else:
+            n = self.auth.attempts_left(ip)
+            self._json({"error": f"密码错误，还可尝试 {n} 次", "attempts_left": n}, 401)
+
+    def _do_setup(self) -> None:
+        payload = self._body()
+        if not self._is_local():
+            self._json({"error": "首次设置密码需在运行程序的电脑上操作（127.0.0.1）"}, 403)
+            return
+        if self.auth.configured:
+            self._json({"error": "密码已存在，请直接登录；忘记密码可删除 key 文件后重启"}, 409)
+            return
+        pw = str(payload.get("password", ""))
+        confirm = str(payload.get("confirm", "") or pw)
+        if len(pw.strip()) < 6:
+            self._json({"error": "密码至少 6 位"}, 400)
+            return
+        if pw != confirm:
+            self._json({"error": "两次输入的密码不一致"}, 400)
+            return
+        self.auth.set_password(pw)
+        token = self.auth.new_session()
+        print(f"已设置访问密码（{self.auth.path}）", flush=True)
+        self._json({"ok": True}, 200, self._set_cookie(token))
+
+    def _do_logout(self) -> None:
+        self.auth.revoke(self._token())
+        self._json({"ok": True}, 200, self._set_cookie("", 0))
 
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         v = self.viewer
         try:
-            if u.path == "/":
-                self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            if u.path == "/favicon.ico":
+                self._send(204, b"", "image/x-icon")
+            elif u.path == "/":
+                # 入口只认 /wx：根路径不跳转、不提示，当作不存在
+                self._send(404, b"not found", "text/plain")
+            elif u.path in ("/wx", "/wx/"):
+                mobile = is_mobile_ua(self.headers.get("User-Agent", ""))
+                if not self.auth.configured:
+                    body = auth_page(mobile, True, 0, self._is_local())
+                elif not self._authed():
+                    body = auth_page(mobile, False, self.auth.ban_left(self._ip()))
+                else:
+                    body = build_page(mobile)
+                self._send(200, body.encode("utf-8"), "text/html; charset=utf-8")
+            elif u.path.startswith("/api/") and self._guard():
+                pass
             elif u.path == "/api/status":
                 self._json({"allow_delete": v.allow_delete, "key_desc": v.key_desc,
                             "xor_key": v.xor_key, "ffmpeg": str(v.ffmpeg) if v.ffmpeg else None,
@@ -1038,15 +1065,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            path = urlparse(self.path).path
+            if path == "/api/auth/login":
+                self._do_login()
+                return
+            if path == "/api/auth/setup":
+                self._do_setup()
+                return
+            if path == "/api/auth/logout":
+                self._do_logout()
+                return
+            if self._guard():
+                return
             payload = self._body()
             v = self.viewer
-            if self.path == "/api/rescan":
+            if path == "/api/rescan":
                 self._json(v.start_rescan())
-            elif self.path == "/api/export":
+            elif path == "/api/export":
                 self._json(v.make_export(payload))
-            elif self.path == "/api/delete/preview":
+            elif path == "/api/delete/preview":
                 self._json(v.preview_delete(payload))
-            elif self.path == "/api/delete/commit":
+            elif path == "/api/delete/commit":
                 self._json(v.commit_delete(payload.get("token", ""), payload.get("confirm", "")))
             else:
                 self._send(404, b"not found", "text/plain")
@@ -1090,9 +1129,21 @@ def cmd_probe(args):
 def cmd_serve(args):
     v = build_viewer(args)
     Handler.viewer = v
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    url = f"http://127.0.0.1:{args.port}/"
-    print("微信图片/视频查看器已启动：", url)
+    auth = Auth(KEY_FILE)
+    Handler.auth = auth
+    host = getattr(args, "host", None) or "127.0.0.1"
+    srv = ThreadingHTTPServer((host, args.port), Handler)
+    url = f"http://127.0.0.1:{args.port}/wx"
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    print(f"微信图片/视频查看器 v{APP_VERSION} 已启动：", url)
+    print("入口路径      : /wx（根路径不跳转、不提示，必须手动输入 /wx）")
+    print("监听地址      :", f"{host}:{args.port}", "" if loopback else "（已对外开放）")
+    if not loopback:
+        print("手机/局域网   :", f"http://<本机局域网 IP>:{args.port}/wx")
+        print("安全提示      : 所有接口（含图片/视频）均需登录；首次设置密码请在本机浏览器完成。")
+    print("访问密码      :", "已设置" if auth.configured
+          else f"未设置 —— 首次打开 {url} 会引导设置（至少 6 位）")
+    print("登录保护      :", f"30 秒内连续输错 {MAX_FAILS} 次，禁止该 IP {BAN_SECONDS // 60} 分钟")
     print("模式          :", "允许删除（需二次确认，移入系统回收站）" if v.allow_delete else "只读（默认）")
     print("密钥          :", v.key_desc, "| XOR:", hex(v.xor_key), "| ffmpeg:", v.ffmpeg or "无")
     print("图片目录      :", v.attach)
@@ -1129,6 +1180,7 @@ def cmd_export(args):
 
 def main():
     p = argparse.ArgumentParser(description="微信 4.x 图片/视频查看器（默认只读）")
+    p.add_argument("--version", action="version", version=f"wechat-dat-viewer {APP_VERSION}")
     p.add_argument("--data-root", default=None,
                    help="微信数据根目录（默认自动扫描，并保存到当前文件夹的 wechat_data_root.dat）")
     p.add_argument("--account", default=None, help="账号目录名")
@@ -1140,6 +1192,8 @@ def main():
 
     s = sub.add_parser("serve", help="启动本地看图网页")
     s.add_argument("--port", type=int, default=56789)
+    s.add_argument("--host", default="127.0.0.1",
+                   help="监听地址，默认 127.0.0.1（仅本机）；手机访问用 0.0.0.0 或本机局域网 IP")
     s.add_argument("--open", action="store_true")
     s.add_argument("--allow-delete", action="store_true",
                    help="显式启用删除能力（仍需二次确认，文件移入系统回收站）")

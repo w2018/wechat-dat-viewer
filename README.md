@@ -2,12 +2,14 @@
 
 <h1>微信 4.x 图片 / 视频查看器</h1>
 
-<p>本地查看、导出、清理微信电脑版缓存的聊天图片与视频。零第三方依赖，默认只读。</p>
+<p>本地查看、导出、清理微信电脑版缓存的聊天图片与视频。零第三方依赖，默认只读；带登录验证，可只在本机用，也可开给同一 Wi-Fi 下的手机。</p>
 
 <p>
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/dependencies-none-green" alt="Dependencies">
-  <img src="https://img.shields.io/badge/mode-local_only-lightgrey" alt="Mode">
+  <img src="https://img.shields.io/badge/mode-local%2BLAN-lightgrey" alt="Mode">
+  <img src="https://img.shields.io/badge/login-password-blue" alt="Login">
+  <img src="https://img.shields.io/badge/mobile-optimized-9cf" alt="Mobile">
 </p>
 
 </div>
@@ -39,18 +41,26 @@
 - **批量导出**：打包 ZIP 到 `exports/`，绝不写回微信目录。
 - **批量删除**：默认关闭，需显式开启；两步确认后分批移入系统回收站。
 - **降级提示**：整组都解不出或视频无法播放时才显示简洁占位图，不出现破图；`wxgf` 高清原图缺 ffmpeg 时悬浮信息标注「原图需 ffmpeg」，缩略图照常显示。
-- **零依赖 / 本地**：纯 Python AES，服务只绑定 `127.0.0.1`，看图与播放走内存响应。
+- **登录验证**：首次打开引导设置访问密码（至少 6 位，PBKDF2 加盐哈希存 `wechat_viewer_key.json`）；除登录/设置页外**所有接口（含图片、视频流、导出、删除）都要校验会话**。
+- **防爆破**：同一 IP 30 秒内连续输错 3 次，封禁该 IP 10 分钟，登录页显示倒计时；成功登录即清零。
+- **手机界面**：按 UA 自动切换，手机端为独立布局——双列卡片、可折叠筛选、底部操作栏、点 `i` 弹出信息面板、大图左右滑动切换。
+- **独立入口 `/wx`**：页面只挂在 `/wx`，根路径 `/` 与 `/index.html` 一律返回 404，不跳转也不提示，局域网里相当于一道隐藏入口。
+- **零依赖 / 本地**：纯 Python AES，默认只绑定 `127.0.0.1`，看图与播放走内存响应；需要手机访问时用 `--host 0.0.0.0` 且必须先设密码。
 
 ## Requirements
 
 - Windows + Python 3.10+（仅标准库）
 - 微信电脑版 4.x 的本地数据目录：启动时自动扫描；也可用 `--data-root` 或环境变量 `WECHAT_DATA_ROOT` 指定
 - 扫描结果保存在当前文件夹的 `wechat_data_root.dat`，下次直接复用；该文件已被 `.gitignore` 排除
+- 访问密码保存在程序同级的 `wechat_viewer_key.json`（PBKDF2-SHA256，20 万次迭代 + 随机盐，**不存明文**），同样已被 `.gitignore` 排除
 - 可选：**完整版** ffmpeg（需含 HEVC demuxer 与 MJPEG encoder），用于解码 `wxgf` 高清原图；放到 PATH 或用 `--ffmpeg` / `WECHAT_FFMPEG` 指定。未配置时按「高清图 → 主图 → 缩略图」回退，明文 JPEG 缩略图仍可正常显示。工具不会自动扫描 ffmpeg 安装位置
 
 ## Quick Start
 
 ```bash
+# 查看版本
+python wechat_dat_viewer.py --version
+
 # 1) 自检（自动扫描微信数据目录，结果写入 wechat_data_root.dat）
 python wechat_dat_viewer.py probe
 
@@ -62,7 +72,18 @@ python wechat_dat_viewer.py probe --data-root "D:\YourPath\xwechat_files"
 # 或：set WECHAT_DATA_ROOT=D:\YourPath\xwechat_files
 ```
 
-也可以双击 `start_viewer.bat`（只读）或 `start_viewer_delete.bat`（启用删除）。启动后访问 `http://127.0.0.1:56789`。
+也可以双击 `start_viewer.bat`（只读）或 `start_viewer_delete.bat`（启用删除）。启动后访问 **`http://127.0.0.1:56789/wx`**。入口只认 `/wx`，根路径 `/` 返回 404、不跳转也不提示，必须手动输入 `/wx`；局域网访问时这相当于一道隐藏入口。
+
+**首次启动**会要求设置访问密码（至少 6 位），设置后写入 `wechat_viewer_key.json`，以后打开先登录。忘记密码：删掉该文件重启，重新设置即可。
+
+想让手机在同一 Wi-Fi 下访问（必须先设好密码）：
+
+```bash
+python wechat_dat_viewer.py serve --host 0.0.0.0
+# 控制台会提示 http://<本机局域网IP>:56789/wx，手机手动输入完整地址
+```
+
+`--host` 默认 `127.0.0.1`（仅本机）。对外开放时所有接口都要登录；**首次设置密码只能在运行程序的电脑上（127.0.0.1）完成**，防止局域网里别人抢先设置。
 
 命令行导出（不启动网页）：
 
@@ -72,7 +93,7 @@ python wechat_dat_viewer.py export \
   --out "./exports/images" --limit 50
 ```
 
-常用参数：`--data-root`、`--account`、`--sessions-csv`、`--ffmpeg`、`--port`、`--allow-delete`、`--open`。
+常用参数：`--data-root`、`--account`、`--sessions-csv`、`--ffmpeg`、`--port`、`--host`、`--allow-delete`、`--open`。
 
 ## 使用说明
 
@@ -87,6 +108,20 @@ python wechat_dat_viewer.py export \
 
 删除链路：`preview` 生成完整文件清单 + 一次性令牌 → 前端手工输入 `MOVE_TO_RECYCLE_BIN` → `commit` 校验令牌与确认词 → 每批 ≤10 个经 `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站，逐批验证、失败即停，并写 `delete_log.jsonl`。数据库与配置文件一律拒绝操作。硬链接文件删除后不一定立刻释放空间，需清空回收站才真正腾出磁盘。
 
+## 登录与安全
+
+| 项 | 说明 |
+| --- | --- |
+| 入口 | 页面只挂在 `/wx`；`/` 与 `/index.html` 返回 404，不跳转不提示，需手动输入完整地址 |
+| 密码 | 至少 6 位；PBKDF2-SHA256（20 万次迭代 + 16 字节随机盐），只存哈希与盐 |
+| 会话 | 登录后下发 HttpOnly + SameSite=Lax 的随机 token，12 小时有效；服务重启即失效 |
+| 保护范围 | 页面与全部 `/api/*`（图片、视频流、导出、下载、删除）都校验；未登录一律 401 |
+| 限速 | 同一 IP 30 秒内连续输错 3 次 → 封禁 10 分钟；封禁期内正确密码也拒绝 |
+| 退出 | 桌面右上角「退出登录」/ 手机底栏「退出」，服务端同步吊销 token |
+| 忘记密码 | 删除 `wechat_viewer_key.json` 后重启，重新设置 |
+
+失败计数与会话只存在内存，重启清零；计数按客户端 IP，同一台机器上的所有浏览器共用额度。`--host 0.0.0.0` 是明文 HTTP，密码和图片流量都在局域网里，请只在可信网络使用。
+
 ## 技术实现
 
 - 图片 `.dat` 为微信 4.0 的 V2 格式：15B 头 `07 08 56 32 08 07` + AES-128-ECB 段（PKCS#7）+ 单字节 XOR 尾段。密钥可纯离线推导：AES key = `MD5(UIN + wxid)[:16]`，XOR key = `UIN & 0xFF`，UIN 取自 `%APPDATA%\Tencent\xwechat\net\kvcomm\key_<uin>_*.statistic` 文件名。实现为纯 Python，已与 OpenSSL 交叉验证。
@@ -98,8 +133,9 @@ python wechat_dat_viewer.py export \
 
 ```
 wechat-dat-viewer/
-├── wechat_dat_viewer.py        # 主程序：probe / serve / export + 网页界面
+├── wechat_dat_viewer.py        # 主程序：probe / serve / export + 路由与登录鉴权
 ├── wechat_dat_core.py          # AES、V2 解析、密钥发现、MP4 头、回收站
+├── wechat_viewer_ui.py         # 网页模板：桌面 / 手机两套界面 + 登录页
 ├── start_viewer.bat            # 只读启动
 ├── start_viewer_delete.bat     # 带删除启动
 ├── .gitignore
@@ -107,9 +143,20 @@ wechat-dat-viewer/
 └── README.md
 ```
 
-`exports/`、`delete_log.jsonl` 与 `wechat_data_root.dat` 在运行时生成，均已被 `.gitignore` 排除。
+`exports/`、`delete_log.jsonl`、`wechat_data_root.dat` 与 `wechat_viewer_key.json` 在运行时生成，均已被 `.gitignore` 排除。
 
 ## 更新日志
+
+### v0.3.0
+
+- 新增 Web 登录验证：首次使用引导设置密码（≥6 位），PBKDF2-SHA256 加盐哈希存同级 `wechat_viewer_key.json`，不存明文
+- 全部接口（图片、视频流、导出、删除）强制校验会话，未登录一律 401，不再只挡页面
+- 同一 IP 30 秒内连续输错 3 次封禁 10 分钟，登录页显示倒计时；成功登录清零
+- 新增 `--host` 参数（默认 `127.0.0.1`），可用 `0.0.0.0` 让手机在同一 Wi-Fi 访问；首次设置密码仅限本机
+- 页面入口改为 `/wx`，`/` 与 `/index.html` 返回 404、不跳转不提示
+- 新增退出登录按钮（桌面右上角 / 手机底栏），服务端同步吊销 token
+- 新增手机端独立界面：双列卡片、可折叠筛选、底部操作栏、点 `i` 看详情、大图左右滑动
+- 网页模板拆到 `wechat_viewer_ui.py`，桌面与手机共用一份 JS
 
 ### v0.2.0
 
@@ -128,6 +175,10 @@ wechat-dat-viewer/
 - **悬浮信息显示「原图需 ffmpeg」**：缩略图和大图仍可看（回退到明文 JPEG），只是 `wxgf` 高清原图解码不了；安装完整版 ffmpeg 后用 `--ffmpeg` 或 `WECHAT_FFMPEG` 指定即可。
 - **视频出现「不支持播放，需要解码器」**：浏览器无法解码该编码，可用系统播放器打开导出的 MP4。
 - **提示「未找到微信 4.x 数据目录」**：确认微信 PC 版登录过并生成了 `xwechat_files`；用 `--data-root` 指定一次，或设置 `WECHAT_DATA_ROOT`。
+- **忘了密码 / 密码输错被锁**：删掉程序目录的 `wechat_viewer_key.json` 重启可重设密码；封禁只存在内存，重启服务也会立即解除。
+- **手机打不开**：确认启动时加了 `--host 0.0.0.0`、手机与电脑在同一 Wi-Fi、地址写全 `/wx`；仍不行就检查路由器是否开了 AP 隔离或访客网络隔离。
+- **打开 `http://IP:56789/` 显示 404**：这是刻意设计，入口只认 `/wx`，手动补上 `/wx` 即可。
+- **手机端和电脑端界面不一样**：按 UA 自动切换，手机是独立布局（双列、底部操作栏、点 `i` 看详情）；想强制用桌面版可在手机浏览器里选「请求桌面网站」。
 - **换了数据目录 / 迁移了微信文件**：删掉当前文件夹的 `wechat_data_root.dat` 再启动，或用 `--data-root` 覆盖并重写配置。
 - **Python 启动报 `SRE module mismatch`**：`PYTHONHOME` 指向了损坏的解释器，先清空该环境变量；启动器已处理。
 - **图片打不开**：先跑 `probe` 检查密钥；`wxgf` 高清原图需完整版 ffmpeg，缩略图通常仍可显示。
