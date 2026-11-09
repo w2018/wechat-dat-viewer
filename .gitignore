@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+exports/
+delete_log.jsonl
+wechat_data_root.dat
+*.dat
+*.zip
+*.jpg
+*.jpeg
+*.png
+*.mp4
+_test*/
+_sandbox/
+.venv/
+.idea/
+.vscode/
