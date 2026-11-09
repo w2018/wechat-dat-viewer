@@ -79,8 +79,11 @@ DEFAULT_CSV = TOOL_DIR / "sessions.csv"
 DEFAULT_EXPORT = TOOL_DIR / "exports" / "images"
 EXPORT_DIR = TOOL_DIR / "exports"
 DELETE_LOG = TOOL_DIR / "delete_log.jsonl"
+OP_LOG = TOOL_DIR / "operation_log.jsonl"         # 操作日志（含来源 IP），已被 .gitignore 排除
+OP_LOG_MAX = 5000                                  # 超过这个行数自动截断，只留最近 5000 条
+CLEAR_CONFIRM = "CLEAR_LOGS"                       # 清空操作日志的二次确认词
 CONFIG_FILE = TOOL_DIR / "wechat_data_root.dat"   # 运行时生成，已被 .gitignore 排除
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 KEY_FILE = TOOL_DIR / "wechat_viewer_key.json"    # 访问密码（PBKDF2 哈希），已被 .gitignore 排除
 
 SESSION_COOKIE = "wv_session"
@@ -309,6 +312,46 @@ CONFIRM_WORD = "MOVE_TO_RECYCLE_BIN"
 BATCH_SIZE = 10
 TOKEN_TTL = 600
 
+# 删除时可按类型勾选：同一张图在微信目录里通常有 3 个文件
+KIND_ORDER = ("main", "hd", "thumb")
+KIND_LABEL = {
+    ("image", "main"): ("普通图", ".dat · 微信压缩版"),
+    ("image", "hd"): ("原图", "_h.dat · 高清原版"),
+    ("image", "thumb"): ("缩略图", "_t.dat · 聊天列表预览"),
+    ("video", "main"): ("视频", ".mp4 · 视频本体"),
+    ("video", "thumb"): ("封面图", ".jpg · 视频首帧"),
+}
+# 缩略图默认不勾：体积小，删了只影响聊天列表里的小图
+KIND_DEFAULT = {"main": True, "hd": True, "thumb": False}
+
+# 操作日志的类型标签
+OP_LABEL = {
+    "login": "登录", "login_fail": "登录失败", "setup": "设置密码",
+    "logout": "退出登录", "export": "导出", "delete": "删除", "clear": "清空日志",
+}
+
+
+def group_kind(item: dict) -> str:
+    """一张卡片实际代表哪一类：有原图就算原图，其次普通图，最后缩略图。"""
+    if item.get("has_hd"):
+        return "hd"
+    if item.get("has_main"):
+        return "main"
+    return "thumb"
+
+
+def variant_of(path: Path, zone: str) -> str:
+    """按文件名判定文件类型：main / hd / thumb。"""
+    name = Path(path).name.lower()
+    if zone == "video":
+        return "main" if name.endswith(".mp4") else "thumb"
+    stem = Path(path).stem.lower()
+    if stem.endswith("_h"):
+        return "hd"
+    if stem.endswith("_t"):
+        return "thumb"
+    return "main"
+
 
 class Viewer:
     def __init__(self, data_root: Path, account: str | None, sessions_csv: Path,
@@ -334,6 +377,12 @@ class Viewer:
                                   "elapsed": 0.0, "message": "", "finished": False,
                                   "error": ""}
         self._sessions_cache: list[dict] | None = None
+        self._del_lock = threading.Lock()
+        self._op_lock = threading.Lock()
+        self._del_state: dict = {"running": False, "total": 0, "done": 0,
+                                 "deleted": 0, "failed": 0, "bytes_total": 0,
+                                 "bytes_done": 0, "current": "", "finished": False,
+                                 "error": "", "result": None}
         self._resolve_keys()
 
     # ------------------------------------------------------------ 初始化 ---
@@ -570,16 +619,19 @@ class Viewer:
             g["variants"][variant] = f.name
             g["size"] += f.stat().st_size
         return [{"base": g["base"], "size": g["size"],
+                 "has_main": "main" in g["variants"],
                  "has_hd": "hd" in g["variants"], "has_thumb": "thumb" in g["variants"]}
                 for g in sorted(groups.values(), key=lambda x: x["base"])]
 
-    def images(self, sid: str, month: str, offset: int, limit: int):
+    def images(self, sid: str, month: str, offset: int, limit: int, kind: str = "all"):
         if not SID_RE.match(sid) or not MONTH_RE.match(month):
             return 0, []
         img = self.attach / sid / month / "Img"
         if not img.is_dir():
             return 0, []
         items = self._group_files(img)
+        if kind in KIND_ORDER:                      # 按卡片上显示的标签筛，三者互斥
+            items = [it for it in items if group_kind(it) == kind]
         return len(items), (items[offset:offset + limit] if limit > 0 else items)
 
     def needs_ffmpeg(self, sid: str, month: str, base: str) -> bool:
@@ -762,14 +814,14 @@ class Viewer:
                      else self.video_group_paths(month, base))
             if not paths:
                 continue
-            metas = [file_meta(p) for p in paths]
+            metas = [dict(file_meta(p), kind=variant_of(p, zone)) for p in paths]
             out.append({"base": base, "files": metas,
                         "size": sum(m["size"] for m in metas),
                         "nlink_max": max(m["nlink"] for m in metas)})
         return out
 
     # ------------------------------------------------------------ 批量导出 ---
-    def make_export(self, payload: dict) -> dict:
+    def make_export(self, payload: dict, ip: str = "") -> dict:
         targets = self.resolve_targets(payload)
         if not targets:
             raise ValueError("没有可导出的文件")
@@ -798,10 +850,33 @@ class Viewer:
                     thumb, _ = self.video_thumb(month, base)
                     if thumb:
                         z.writestr(f"{month}_{base}_thumb.jpg", thumb)
+        self.log_op("export", ip,
+                    f"{zone} · {month} · 打包 {count} 个文件 → {name}",
+                    files=[t["base"] for t in targets])
         return {"name": name, "path": str(zp), "count": count,
                 "bytes": zp.stat().st_size, "dir": str(EXPORT_DIR)}
 
     # ------------------------------------------------------------ 删除链路 ---
+    def _kind_summary(self, targets: list[dict], zone: str) -> list[dict]:
+        """按文件类型汇总，供前端做勾选（默认不勾缩略图）。"""
+        agg: dict[str, dict] = {}
+        for t in targets:
+            for f in t["files"]:
+                k = f.get("kind", "main")
+                a = agg.setdefault(k, {"kind": k, "count": 0, "size": 0})
+                a["count"] += 1
+                a["size"] += f["size"]
+        out = []
+        for k in KIND_ORDER:
+            if k not in agg:
+                continue
+            name, desc = KIND_LABEL.get((zone, k), (k, ""))
+            a = agg[k]
+            out.append({"kind": k, "label": name, "desc": desc,
+                        "count": a["count"], "size": a["size"],
+                        "default": KIND_DEFAULT.get(k, True)})
+        return out
+
     def preview_delete(self, payload: dict) -> dict:
         if not self.allow_delete:
             raise PermissionError("删除功能未启用：启动服务时需加 --allow-delete")
@@ -809,15 +884,17 @@ class Viewer:
         if not targets:
             raise ValueError("没有可删除的文件")
         files = [f for t in targets for f in t["files"]]
+        zone = payload["zone"]
         token = secrets.token_urlsafe(24)
         self._tokens[token] = {"ts": time.time(), "targets": targets,
-                              "zone": payload["zone"], "month": payload["month"],
+                              "zone": zone, "month": payload["month"],
                               "sid": payload.get("sid", "")}
         return {
             "token": token, "confirm_word": CONFIRM_WORD,
             "group_count": len(targets), "file_count": len(files),
             "total_size": sum(f["size"] for f in files),
             "hardlinked_files": sum(1 for f in files if f["nlink"] > 1),
+            "kinds": self._kind_summary(targets, zone),
             "files": files,
             "warning": "此操作非常危险，可能导致不可逆的数据丢失！文件将被移入系统回收站；"
                        "微信聊天记录中的对应图片/视频会失效，且微信可能重新下载。",
@@ -828,41 +905,154 @@ class Viewer:
         with DELETE_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def commit_delete(self, token: str, confirm: str) -> dict:
+    # ------------------------------------------------------------ 操作日志 ---
+    def log_op(self, action: str, ip: str = "", detail: str = "",
+               files: list[str] | None = None, ok: bool = True) -> None:
+        """记一条操作日志：时间、来源 IP、类型、涉及文件（只留文件名，最多 20 个）。"""
+        names = [Path(p).name for p in (files or [])][:20]
+        rec = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+               "action": action, "label": OP_LABEL.get(action, action),
+               "ip": ip or "-", "detail": detail,
+               "count": len(files or []), "files": names, "ok": bool(ok)}
+        try:
+            with self._op_lock:
+                with OP_LOG.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                if OP_LOG.stat().st_size > 2 * 1024 * 1024:   # 防无限膨胀
+                    lines = OP_LOG.read_text(encoding="utf-8").splitlines()[-OP_LOG_MAX:]
+                    OP_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as e:
+            sys.stderr.write(f"  操作日志写入失败：{e}\n")
+
+    def read_logs(self, limit: int = 200) -> dict:
+        try:
+            limit = max(1, min(int(limit or 200), 1000))
+        except (TypeError, ValueError):
+            limit = 200
+        try:
+            lines = OP_LOG.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        items = []
+        for ln in reversed(lines[-limit:]):       # 倒序：最新的在最上面
+            try:
+                items.append(json.loads(ln))
+            except ValueError:
+                continue
+        return {"total": len(lines), "items": items, "path": str(OP_LOG)}
+
+    def clear_logs(self, confirm: str, ip: str = "") -> dict:
+        if confirm != CLEAR_CONFIRM:
+            raise ValueError("确认词不正确，未清空任何日志")
+        try:
+            removed = len(OP_LOG.read_text(encoding="utf-8").splitlines())
+        except OSError:
+            removed = 0
+        OP_LOG.write_text("", encoding="utf-8")
+        self.log_op("clear", ip, f"清空 {removed} 条操作记录")   # 清空动作本身也留痕
+        return {"cleared": removed, "path": str(OP_LOG)}
+
+    def commit_delete(self, token: str, confirm: str, kinds=None, ip: str = "") -> dict:
+        """校验通过后启动后台线程分批删除，前端轮询 /api/delete/status 看进度。"""
         if not self.allow_delete:
             raise PermissionError("删除功能未启用")
-        rec = self._tokens.pop(token, None)
+        rec = self._tokens.get(token)
         if not rec or time.time() - rec["ts"] > TOKEN_TTL:
+            self._tokens.pop(token, None)
             raise ValueError("确认令牌无效或已过期，请重新预览")
         if confirm != CONFIRM_WORD:
             raise ValueError("二次确认未通过：确认词不正确")
-        all_paths = [f["path"] for t in rec["targets"] for f in t["files"]]
+        with self._del_lock:
+            if self._del_state["running"]:
+                raise ValueError("已有删除任务在执行，请等它跑完")
+            wanted = {k for k in (kinds or []) if k in KIND_ORDER}
+            if not wanted:
+                # 未指定类型时按默认（原图 + 普通图），绝不顺手带上缩略图
+                wanted = {k for k, on in KIND_DEFAULT.items() if on}
+            plan = []
+            for t in rec["targets"]:
+                for f in t["files"]:
+                    if f.get("kind", "main") in wanted:
+                        plan.append(f)
+            if not plan:
+                raise ValueError("没有勾选任何要删除的文件类型")
+            self._tokens.pop(token, None)
+            self._del_state = {
+                "running": True, "total": len(plan), "done": 0,
+                "deleted": 0, "failed": 0,
+                "bytes_total": sum(f["size"] for f in plan), "bytes_done": 0,
+                "current": "", "finished": False, "error": "", "result": None,
+                "kinds": sorted(wanted),
+            }
+        threading.Thread(target=self._delete_worker,
+                         args=(plan, rec, sorted(wanted), ip), daemon=True).start()
+        return {"started": True, "total": len(plan),
+                "bytes_total": self._del_state["bytes_total"]}
+
+    def delete_status(self) -> dict:
+        with self._del_lock:
+            return dict(self._del_state)
+
+    def _delete_worker(self, plan: list[dict], rec: dict, kinds: list[str], ip: str = "") -> None:
         deleted: list[str] = []
         failed: list[str] = []
         batches = 0
-        for i in range(0, len(all_paths), BATCH_SIZE):
-            batch = all_paths[i:i + BATCH_SIZE]
-            # 提交前再校验一次，防止清单生成后路径被替换
-            batch = [str(self._safe_media(Path(x))) for x in batch]
-            r = recycle_batch([Path(x) for x in batch])
-            still = [x for x in batch if Path(x).exists()]
-            if not r["ok"] or still:
-                failed.extend(still or batch)
+        paths = [f["path"] for f in plan]
+        size_of = {f["path"]: f["size"] for f in plan}
+        for i in range(0, len(paths), BATCH_SIZE):
+            batch = paths[i:i + BATCH_SIZE]
+            try:
+                # 提交前再校验一次，防止清单生成后路径被替换
+                batch = [str(self._safe_media(Path(x))) for x in batch]
+                with self._del_lock:
+                    self._del_state["current"] = Path(batch[0]).name
+                r = recycle_batch([Path(x) for x in batch])
+                still = [x for x in batch if Path(x).exists()]
+                ok = [x for x in batch if x not in still]
+                deleted.extend(ok)
+                with self._del_lock:
+                    self._del_state["deleted"] = len(deleted)
+                    self._del_state["done"] = len(deleted) + len(failed)
+                    self._del_state["bytes_done"] += sum(size_of.get(x, 0) for x in ok)
+                if not r["ok"] or still:
+                    failed.extend(still or batch)
+                    with self._del_lock:
+                        self._del_state["failed"] = len(failed)
+                        self._del_state["done"] = len(deleted) + len(failed)
+                    break
+                batches += 1
+            except Exception as e:  # 单批异常也要如实记录，不能静默
+                failed.extend(batch)
+                with self._del_lock:
+                    self._del_state["failed"] = len(failed)
+                    self._del_state["error"] = str(e)
                 break
-            deleted.extend(batch)
-            batches += 1
         record = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "zone": rec["zone"], "sid": rec["sid"], "month": rec["month"],
+            "kinds": kinds,
             "groups": len(rec["targets"]), "deleted": len(deleted),
             "failed": len(failed), "batches": batches,
             "paths": deleted, "failed_paths": failed,
             "method": "SHFileOperationW/FOF_ALLOWUNDO (系统回收站)",
         }
         self._append_log(record)
-        return {"deleted": len(deleted), "failed": len(failed), "batches": batches,
-                "failed_paths": failed, "log": str(DELETE_LOG),
-                "stopped_early": bool(failed)}
+        kind_txt = "、".join(KIND_LABEL.get((rec["zone"], k), (k, ""))[0] for k in kinds)
+        self.log_op("delete", ip,
+                    f"{rec['month']} · {kind_txt} · 移入回收站 {len(deleted)} 个文件"
+                    + (f"（失败 {len(failed)} 个）" if failed else ""),
+                    files=deleted, ok=not failed)
+        with self._del_lock:
+            self._del_state.update({
+                "running": False, "finished": True, "current": "",
+                "done": len(deleted) + len(failed),
+                "deleted": len(deleted), "failed": len(failed),
+                "bytes_done": sum(size_of.get(x, 0) for x in deleted),
+                "result": {"deleted": len(deleted), "failed": len(failed),
+                           "batches": batches, "failed_paths": failed,
+                           "log": str(DELETE_LOG), "stopped_early": bool(failed),
+                           "kinds": kinds},
+            })
 
 
 # ------------------------------------------------------------------- HTML ---
@@ -937,19 +1127,23 @@ class Handler(BaseHTTPRequestHandler):
         ip = self._ip()
         left = self.auth.ban_left(ip)
         if left > 0:
+            self.viewer.log_op("login_fail", ip, f"封禁期内尝试登录（剩余 {left} 秒）", ok=False)
             self._json({"error": f"尝试次数过多，请在 {left // 60} 分 {left % 60} 秒后重试",
                         "retry_after": left}, 429)
             return
         if self.auth.verify(str(payload.get("password", ""))):
             self.auth.clear_failure(ip)
+            self.viewer.log_op("login", ip, "密码验证通过")
             token = self.auth.new_session()
             self._json({"ok": True}, 200, self._set_cookie(token))
             return
         ban = self.auth.note_failure(ip)
         if ban:
+            self.viewer.log_op("login_fail", ip, "30 秒内连续输错 3 次，已封禁 10 分钟", ok=False)
             self._json({"error": "30 秒内连续输错 3 次，已禁止该 IP 访问 10 分钟", "retry_after": ban}, 429)
         else:
             n = self.auth.attempts_left(ip)
+            self.viewer.log_op("login_fail", ip, f"密码错误（还可尝试 {n} 次）", ok=False)
             self._json({"error": f"密码错误，还可尝试 {n} 次", "attempts_left": n}, 401)
 
     def _do_setup(self) -> None:
@@ -969,12 +1163,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "两次输入的密码不一致"}, 400)
             return
         self.auth.set_password(pw)
+        self.viewer.log_op("setup", self._ip(), "设置访问密码")
         token = self.auth.new_session()
         print(f"已设置访问密码（{self.auth.path}）", flush=True)
         self._json({"ok": True}, 200, self._set_cookie(token))
 
     def _do_logout(self) -> None:
         self.auth.revoke(self._token())
+        self.viewer.log_op("logout", self._ip(), "退出登录")
         self._json({"ok": True}, 200, self._set_cookie("", 0))
 
     def do_GET(self):
@@ -1004,6 +1200,13 @@ class Handler(BaseHTTPRequestHandler):
                             "video_dir": str(v.video_dir)})
             elif u.path == "/api/rescan/status":
                 self._json(v.scan_status())
+            elif u.path == "/api/delete/status":
+                self._json(v.delete_status())
+            elif u.path == "/api/logs":
+                data = v.read_logs(q.get("limit", ["200"])[0])
+                data["ip"] = self._ip()
+                data["clear_word"] = CLEAR_CONFIRM
+                self._json(data)
             elif u.path == "/api/sessions":
                 self._json(v.sessions())
             elif u.path == "/api/months":
@@ -1011,7 +1214,8 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/images":
                 total, items = v.images(q.get("sid", [""])[0], q.get("month", [""])[0],
                                         max(0, int(q.get("offset", ["0"])[0])),
-                                        min(600, max(0, int(q.get("limit", ["120"])[0]))))
+                                        min(600, max(0, int(q.get("limit", ["120"])[0]))),
+                                        q.get("kind", ["all"])[0])
                 self._json({"total": total, "items": items})
             elif u.path == "/api/img":
                 data, mime = v.image_bytes(q.get("sid", [""])[0], q.get("month", [""])[0],
@@ -1082,11 +1286,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/rescan":
                 self._json(v.start_rescan())
             elif path == "/api/export":
-                self._json(v.make_export(payload))
+                self._json(v.make_export(payload, self._ip()))
             elif path == "/api/delete/preview":
                 self._json(v.preview_delete(payload))
             elif path == "/api/delete/commit":
-                self._json(v.commit_delete(payload.get("token", ""), payload.get("confirm", "")))
+                self._json(v.commit_delete(payload.get("token", ""),
+                                           payload.get("confirm", ""),
+                                           payload.get("kinds") or [],
+                                           self._ip()))
+            elif path == "/api/logs/clear":
+                self._json(v.clear_logs(str(payload.get("confirm", "")), self._ip()))
             else:
                 self._send(404, b"not found", "text/plain")
         except (PermissionError, ValueError) as e:

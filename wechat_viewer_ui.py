@@ -30,10 +30,17 @@ main{padding:14px 20px 40px}
 .months{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
 .months button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
-.cell{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden;position:relative;cursor:zoom-in}
+.cell{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden;position:relative;cursor:pointer}
 .cell.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.18)}
+#box #big{transition:transform .12s ease-out;touch-action:none;user-select:none;-webkit-user-drag:none}
 .cell img{width:100%;height:140px;object-fit:cover;display:block;background:#eef0f3}
-.cell .meta{padding:6px 8px;font-size:11px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cell .meta{display:flex;align-items:center;gap:6px;padding:6px 8px;font-size:11px;color:var(--sub);overflow:hidden}
+.cell .meta .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cell .meta .kt{flex:none;font-size:10.5px;font-weight:700;letter-spacing:.2px}
+.cell .meta .kt-hd{color:#dc2626}
+.cell .meta .kt-main{color:#2563eb}
+.cell .meta .kt-thumb{color:#8b929c}
+.cell .meta .kt-video{color:#7c3aed}
 .cell .chk{position:absolute;top:6px;left:6px;width:18px;height:18px;cursor:pointer;accent-color:var(--accent)}
 .cell .play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
 .cell .play span{background:rgba(0,0,0,.55);color:#fff;border-radius:50%;width:34px;height:34px;display:flex;align-items:center;justify-content:center;font-size:14px}
@@ -62,6 +69,34 @@ main{padding:14px 20px 40px}
 #scanfill{height:100%;width:0;background:var(--accent);transition:width .25s}
 #scantext{font-size:12px;color:var(--sub);white-space:nowrap}
 #scantext.done{color:#16a34a}#scantext.err{color:var(--danger)}
+.kfilter{font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text);cursor:pointer;flex:none}
+.krow{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;margin-bottom:8px;cursor:pointer;user-select:none}
+.krow:hover{border-color:#c7cdd6}
+.krow.on{border-color:#fca5a5;background:#fff7f7}
+.krow input{width:16px;height:16px;flex:none;margin:0;accent-color:var(--danger)}
+.krow .ktxt{display:flex;flex-direction:column;line-height:1.4;min-width:0}
+.krow .klabel{font-weight:600;font-size:13px}
+.krow .kdesc{color:var(--sub);font-size:12px}
+.krow .kstat{margin-left:auto;color:var(--sub);font-size:12px;white-space:nowrap;padding-left:8px}
+.dprog{display:flex;flex-direction:column;gap:10px}
+.dprog .track{max-width:none;height:10px;background:#e9edf2}
+.dprog #dfill{height:100%;width:0;background:linear-gradient(90deg,#dc2626,#f97316);transition:width .2s}
+.dprog .num{font-size:13px}
+.dprog .num b{color:var(--danger)}
+.dprog .cur{color:var(--sub);font-size:11px;font-family:Consolas,monospace;word-break:break-all;line-height:1.5}
+.llist{max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.lrow{padding:8px 10px;border-bottom:1px solid var(--line);font-size:12px}
+.lrow:last-child{border-bottom:0}
+.lrow.bad{background:#fff7f7}
+.lhead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ltime{font-family:Consolas,monospace;color:var(--sub)}
+.lip{color:var(--accent);font-family:Consolas,monospace}
+.ltag{background:#eef2f7;border-radius:4px;padding:1px 6px;font-weight:600}
+.lrow.bad .ltag{background:#fee2e2;color:#b91c1c}
+.ldetail{margin-top:3px;line-height:1.5;word-break:break-all}
+.lfiles{margin-top:2px;color:var(--sub);font-family:Consolas,monospace;font-size:11px;word-break:break-all}
+.lbar{margin-bottom:8px;color:var(--sub);font-size:12px}
+.lbar b{color:var(--text)}
 """
 
 # ------------------------------------------------------------------ 桌面骨架 ---
@@ -72,13 +107,20 @@ DESKTOP_HTML = r"""
 <div class="bar">
   <div class="tabs"><button id="tab-image" class="on">图片分区</button><button id="tab-video">视频分区</button></div>
   <span class="tag" id="mode"></span>
-  <button id="btn-logout" style="margin-left:auto">退出登录</button>
+  <button id="btn-logs" style="margin-left:auto">操作日志</button>
+  <button id="btn-logout">退出登录</button>
 </div>
 <div class="bar" id="scanbar">
   <button id="btn-rescan">重新扫描</button>
   <div class="scaninfo"><span id="scantext">准备就绪</span><div class="track"><div id="scanfill"></div></div></div>
 </div>
-<div class="bar" id="bar-image"><span class="tag">会话</span><select id="sid" style="min-width:400px"></select></div>
+<div class="bar" id="bar-image">
+  <span class="tag">会话</span><select id="sid" style="min-width:320px;max-width:520px"></select>
+  <select id="kindfilter" class="kfilter" title="按文件类型筛选">
+    <option value="all">全部类型</option><option value="hd">原图</option>
+    <option value="main">普通图</option><option value="thumb">缩略图</option>
+  </select>
+</div>
 <div class="bar"><div class="months" id="months"></div></div>
 <div class="bar">
   <label class="tag"><input type="checkbox" id="selall"> 全选本页</label>
@@ -108,7 +150,13 @@ MOBILE_HTML = r"""
       <div class="scaninfo"><span id="scantext">准备就绪</span><div class="track"><div id="scanfill"></div></div></div>
       <button id="btn-rescan">重新扫描</button>
     </div>
-    <div class="bar" id="bar-image"><span class="tag">会话</span><select id="sid"></select></div>
+    <div class="bar" id="bar-image">
+      <span class="tag">会话</span><select id="sid"></select>
+      <select id="kindfilter" class="kfilter" title="按文件类型筛选">
+        <option value="all">全部</option><option value="hd">原图</option>
+        <option value="main">普通图</option><option value="thumb">缩略图</option>
+      </select>
+    </div>
     <div class="months" id="months"></div>
     <div class="bar"><label class="tag"><input type="checkbox" id="selall"> 全选本页</label><span class="tag" id="stat"></span></div>
   </div>
@@ -118,6 +166,7 @@ MOBILE_HTML = r"""
   <span class="stat" id="selstat">已选 0 项 · 0 MB</span>
   <button id="btn-export" class="primary">导出</button>
   <button id="btn-delete" class="danger">删除</button>
+  <button id="btn-logs">日志</button>
   <button id="btn-logout">退出</button>
 </div>
 """
@@ -163,6 +212,7 @@ main{padding:10px 10px 20px}
 .cell{cursor:pointer}
 .cell img{height:38vw;max-height:190px}
 .cell .meta{font-size:10px;padding:5px 6px}
+  .cell .meta .kt{font-size:9.5px}
 .cell .chk{width:24px;height:24px;top:4px;left:4px}
 .cell .info{display:block;position:absolute;top:4px;right:4px;width:24px;height:24px;padding:0;border-radius:50%;
   background:rgba(0,0,0,.5);color:#fff;border:0;font-size:12px;line-height:24px;text-align:center}
@@ -171,7 +221,7 @@ main{padding:10px 10px 20px}
 .mbar{position:fixed;left:0;right:0;bottom:0;z-index:12;display:flex;gap:8px;align-items:center;
   padding:8px 12px calc(8px + env(safe-area-inset-bottom));background:var(--card);border-top:1px solid var(--line)}
 .mbar .stat{flex:1;font-size:12px;line-height:1.3}
-.mbar button{padding:8px 12px;font-size:13px}
+.mbar button{padding:8px 9px;font-size:12.5px;white-space:nowrap}
 #tip{display:block;visibility:hidden;left:0!important;right:0;top:auto!important;bottom:0;max-width:none;
   border-radius:14px 14px 0 0;padding:14px 16px calc(16px + env(safe-area-inset-bottom));font-size:13px;
   pointer-events:auto;transform:translateY(102%);transition:transform .22s ease;box-shadow:0 -8px 28px rgba(0,0,0,.18);
@@ -201,8 +251,12 @@ input[type=checkbox]{width:20px;height:20px}
 
 APP_JS = r"""
 const MOBILE=__MOBILE_FLAG__;
-let ZONE='image',SID='',MONTH='',OFFSET=0,LIMIT=MOBILE?60:120,TOTAL=0,ALLOW=false,PENDING=null,CUR=-1;
+let ZONE='image',SID='',MONTH='',KIND='all',OFFSET=0,LIMIT=MOBILE?60:120,TOTAL=0,ALLOW=false,PENDING=null,CUR=-1;
 const SEL=new Set(), INFO={};
+let TIP_T=null, TIP_POS=null, TIP_SEQ=0, LOAD_SEQ=0;
+let ZOOM=1, PANX=0, PANY=0, DRAG=null, SUPPRESS=false;
+function applyZoom(){const b=$('big');b.style.transform=`translate(${PANX}px,${PANY}px) scale(${ZOOM})`;b.style.cursor=ZOOM>1?'grab':'default'}
+function resetZoom(){ZOOM=1;PANX=0;PANY=0;applyZoom()}
 let ITEMS=[];
 const $=id=>document.getElementById(id);
 function fmt(n){return n>=1073741824?(n/1073741824).toFixed(2)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(0)+' KB'}
@@ -223,12 +277,20 @@ async function init(){
   const k=await api('/api/status');ALLOW=k.allow_delete;
   $('keyinfo').textContent='密钥 '+k.key_desc;
   $('mode').textContent=ALLOW?(MOBILE?'可删除':'删除已启用（移入回收站）'):'只读模式';
-  $('sid').onchange=()=>{SID=$('sid').value;showMonths()};
+  $('sid').onchange=()=>{SID=$('sid').value;clearSelection();showMonths()};
+  if($('kindfilter'))$('kindfilter').onchange=e=>{
+    KIND=e.target.value;
+    if(MONTH)load(true);            // load(true) 会清掉旧选择与旧卡片
+  };
   $('tab-image').onclick=()=>switchZone('image');$('tab-video').onclick=()=>switchZone('video');
   $('btn-rescan').onclick=()=>startScan();
   if($('btn-logout'))$('btn-logout').onclick=logout;
   if($('btn-menu'))$('btn-menu').onclick=()=>$('panel').classList.toggle('open');
-  $('more').onclick=()=>load(false);
+  $('more').onclick=()=>{
+    if($('more').disabled)return;              // 连点会发出两个同 offset 请求
+    $('more').disabled=true;
+    load(false).finally(()=>{$('more').disabled=false});
+  };
   $('selall').onchange=e=>{
     [...$('grid').children].forEach(c=>{const b=c.dataset.base;if(e.target.checked)SEL.add(b);else SEL.delete(b);c.classList.toggle('sel',e.target.checked);c.querySelector('.chk').checked=e.target.checked});updateStat();
   };
@@ -267,7 +329,14 @@ async function pollScan(){
 function switchZone(z){
   ZONE=z;$('tab-image').classList.toggle('on',z==='image');$('tab-video').classList.toggle('on',z==='video');
   $('bar-image').style.display=z==='image'?'flex':'none';
-  SEL.clear();ITEMS=[];showMonths();
+  clearSelection();showMonths();
+}
+// 切换会话 / 分区时立刻清空界面与选择，避免旧网格配新 sid 造成「看到 A 删 B」
+function clearSelection(){
+  LOAD_SEQ++;                                  // 作废在途的旧请求，避免回来后画到新会话上
+  SEL.clear();ITEMS=[];OFFSET=0;MONTH='';PENDING=null;
+  $('grid').innerHTML='';$('stat').textContent='';$('more').style.display='none';
+  updateStat();
 }
 async function showMonths(){
   const ms=ZONE==='image'?(SID?await api('/api/months?sid='+SID):[]):await api('/api/video_months');
@@ -275,28 +344,47 @@ async function showMonths(){
   [...$('months').children].forEach(b=>b.onclick=()=>{MONTH=b.dataset.m;[...$('months').children].forEach(x=>x.classList.remove('on'));b.classList.add('on');load(true)});
   if(ms.length){MONTH=ms[ms.length-1];$('months').lastChild.classList.add('on');load(true)}else{reset('该分区没有内容')}
 }
-function reset(msg){$('grid').innerHTML='';ITEMS=[];$('more').style.display='none';$('empty').textContent=msg;$('empty').style.display='block';$('stat').textContent='';SEL.clear();updateStat()}
+function reset(msg){LOAD_SEQ++;$('grid').innerHTML='';ITEMS=[];$('more').style.display='none';$('empty').textContent=msg;$('empty').style.display='block';$('stat').textContent='';SEL.clear();updateStat()}
 async function load(fresh){
+  const seq=++LOAD_SEQ;                       // 只认最后一次请求，过期结果直接丢
   if(fresh){OFFSET=0;$('grid').innerHTML='';ITEMS=[];SEL.clear()}
-  const u=ZONE==='image'?`/api/images?sid=${SID}&month=${MONTH}&offset=${OFFSET}&limit=${LIMIT}`:`/api/videos?month=${MONTH}&offset=${OFFSET}&limit=${LIMIT}`;
-  const d=await api(u);TOTAL=d.total;ITEMS=ITEMS.concat(d.items);
+  const start=OFFSET;
+  const u=ZONE==='image'?`/api/images?sid=${SID}&month=${MONTH}&offset=${start}&limit=${LIMIT}&kind=${KIND}`:`/api/videos?month=${MONTH}&offset=${start}&limit=${LIMIT}`;
+  const d=await api(u);
+  if(seq!==LOAD_SEQ)return;                   // 期间已换月份/会话，丢弃这一页
+  TOTAL=d.total;
   $('empty').style.display=TOTAL?'none':'block';
   if(!TOTAL){reset('该月份没有内容');return}
+  if(!d.items.length){$('more').style.display='none';return}
+  const seen=new Set(ITEMS.map(x=>x.base));   // 分页期间目录变动会产生重复，跳过去重
   d.items.forEach(it=>{
+    if(seen.has(it.base))return;
+    seen.add(it.base);
+    ITEMS.push(it);
     const c=document.createElement('div');c.className='cell';c.dataset.base=it.base;
     const src=ZONE==='image'?`/api/img?sid=${SID}&month=${MONTH}&base=${encodeURIComponent(it.base)}&kind=thumb`:`/api/video_thumb?month=${MONTH}&base=${encodeURIComponent(it.base)}`;
-    c.innerHTML=`<input type="checkbox" class="chk" ${SEL.has(it.base)?'checked':''}><img loading="lazy" src="${src}" alt=""><div class="meta">${it.base.slice(0,10)} · ${fmt(it.size)}${it.has_hd?' · 原图':''}</div>${ZONE==='video'?'<div class="play"><span>▶</span></div>':''}${MOBILE?'<button class="info" aria-label="详情">i</button>':''}`;
-    c.querySelector('.chk').onclick=e=>{e.stopPropagation();if(e.target.checked)SEL.add(it.base);else SEL.delete(it.base);c.classList.toggle('sel',e.target.checked);updateStat()};
-    c.onclick=()=>openBox(it);
+    const kindTag = ZONE==='video'
+      ? '<span class="kt kt-video">视频</span>'
+      : it.has_hd ? '<span class="kt kt-hd">原图</span>'
+      : it.has_main ? '<span class="kt kt-main">普通图</span>'
+      : '<span class="kt kt-thumb">缩略图</span>';
+    c.innerHTML=`<input type="checkbox" class="chk" ${SEL.has(it.base)?'checked':''}><img loading="lazy" src="${src}" alt=""><div class="meta"><span class="name">${it.base.slice(0,10)} · ${fmt(it.size)}</span>${kindTag}</div>${ZONE==='video'?'<div class="play"><span>▶</span></div>':''}${MOBILE?'<button class="info" aria-label="详情">i</button>':''}`;
+    const ck=c.querySelector('.chk');
+    const toggle=on=>{if(on)SEL.add(it.base);else SEL.delete(it.base);c.classList.toggle('sel',on);if(ck)ck.checked=on;updateStat()};
+    if(ck)ck.onclick=e=>{e.stopPropagation();toggle(e.target.checked)};
+    c.onclick=e=>{if(e.target===ck||e.target.closest('.info'))return;toggle(!SEL.has(it.base))};
+    c.ondblclick=e=>{if(e.target===ck||e.target.closest('.info'))return;e.preventDefault();openBox(it)};
     if(MOBILE){
       c.querySelector('.info').onclick=e=>{e.stopPropagation();showTip(it.base)};
     }else{
-      c.onmouseenter=e=>showTip(it.base,e);c.onmousemove=moveTip;c.onmouseleave=hideTip;
+      c.onmouseenter=e=>{TIP_POS={clientX:e.clientX,clientY:e.clientY};clearTimeout(TIP_T);TIP_T=setTimeout(()=>showTip(it.base,TIP_POS),500)};
+      c.onmousemove=e=>{TIP_POS={clientX:e.clientX,clientY:e.clientY};if($('tip').style.display==='block')moveTip(TIP_POS)};
+      c.onmouseleave=()=>{clearTimeout(TIP_T);hideTip()};
     }
     $('grid').appendChild(c);
   });
-  OFFSET+=d.items.length;
-  $('stat').textContent=`${MONTH} · 共 ${TOTAL} 项 · 已显示 ${OFFSET} 项`;
+  OFFSET=start+d.items.length;
+  $('stat').textContent=`${MONTH}${({all:'',hd:' · 原图',main:' · 普通图',thumb:' · 缩略图'})[KIND]||''} · 共 ${TOTAL} 项 · 已显示 ${OFFSET} 项`;
   $('more').style.display=OFFSET<TOTAL?'block':'none';
   $('selall').checked=false;updateStat();
 }
@@ -307,17 +395,22 @@ function tipHtml(m){
   return `<div><span class="k">分区</span><b>${ZONE==='image'?'图片':'视频'}</b>　<span class="k">格式</span><b>${m.format}</b></div><div><span class="k">像素尺寸</span><b>${dim}</b>　<span class="k">时长</span>${dur}　<span class="k">合计</span>${fmt(m.total_size)}</div><hr style="border:0;border-top:1px solid #eee">${rows}`;
 }
 async function showTip(base,e){
+  const seq=++TIP_SEQ;                         // 快速划过时只显示最后一张的信息
   const key=ZONE+'|'+SID+'|'+MONTH+'|'+base;
   let m=INFO[key];
   if(!m){
-    m=await api(`/api/info?zone=${ZONE}&sid=${SID}&month=${MONTH}&base=${encodeURIComponent(base)}`);INFO[key]=m;
+    m=await api(`/api/info?zone=${ZONE}&sid=${SID}&month=${MONTH}&base=${encodeURIComponent(base)}`);
+    if(seq!==TIP_SEQ)return;
+    INFO[key]=m;
   }
+  if(seq!==TIP_SEQ)return;
   $('tip').innerHTML=tipHtml(m)+(MOBILE?'<div style="margin-top:10px;color:#6b7280;font-size:12px">点击空白处关闭</div>':'');
   if(MOBILE){$('tip').classList.add('on');$('tipmask').classList.add('on')}
   else{$('tip').style.display='block';moveTip(e)}
 }
 function moveTip(e){const t=$('tip');const x=Math.min(e.clientX+16,innerWidth-480),y=Math.min(e.clientY+16,innerHeight-260);t.style.left=Math.max(8,x)+'px';t.style.top=Math.max(8,y)+'px'}
 function hideTip(){
+  clearTimeout(TIP_T);TIP_T=null;TIP_SEQ++;
   $('tip').classList.remove('on');$('tipmask').classList.remove('on');
   if(!MOBILE)$('tip').style.display='none';
 }
@@ -325,6 +418,7 @@ function renderBox(it){
   if(ZONE==='image'){
     $('vid').style.display='none';$('vid').pause();$('big').style.display='block';
     $('big').src=`/api/img?sid=${SID}&month=${MONTH}&base=${encodeURIComponent(it.base)}&kind=full`;
+    resetZoom();
   }else{
     $('big').style.display='none';$('vid').style.display='block';
     $('vid').src=`/api/video_stream?month=${MONTH}&base=${encodeURIComponent(it.base)}`;$('vid').play().catch(()=>{});
@@ -342,7 +436,32 @@ function hop(d){
   if(n<0||n>=ITEMS.length)return;
   CUR=n;renderBox(ITEMS[n]);
 }
-function closeBox(){$('box').classList.remove('on');$('big').src='';$('vid').pause();$('vid').src=''}
+function closeBox(){$('box').classList.remove('on');$('big').src='';$('vid').pause();$('vid').src='';resetZoom()}
+// 图片预览：滚轮缩放、放大后左键拖动、双击复位
+$('big').addEventListener('wheel',e=>{
+  if(ZONE!=='image'||!$('box').classList.contains('on'))return;
+  e.preventDefault();
+  const nz=Math.min(8,Math.max(1,ZOOM*(e.deltaY<0?1.15:1/1.15)));
+  if(nz===ZOOM)return;
+  ZOOM=nz;if(ZOOM===1){PANX=0;PANY=0}
+  applyZoom();
+},{passive:false});
+$('big').addEventListener('mousedown',e=>{
+  if(ZONE!=='image'||ZOOM<=1)return;
+  DRAG={x:e.clientX,y:e.clientY,px:PANX,py:PANY};
+  $('big').style.cursor='grabbing';$('big').style.transition='none';e.preventDefault();
+});
+addEventListener('mousemove',e=>{
+  if(!DRAG)return;
+  if(Math.abs(e.clientX-DRAG.x)>3||Math.abs(e.clientY-DRAG.y)>3)DRAG.moved=true;
+  PANX=DRAG.px+(e.clientX-DRAG.x);PANY=DRAG.py+(e.clientY-DRAG.y);applyZoom();
+});
+addEventListener('mouseup',()=>{
+  if(!DRAG)return;
+  const moved=DRAG.moved;DRAG=null;$('big').style.transition='';applyZoom();
+  if(moved){SUPPRESS=true;setTimeout(()=>SUPPRESS=false,0)}
+});
+$('big').addEventListener('dblclick',e=>{e.stopPropagation();resetZoom()});
 function videoError(){
   if(!$('box').classList.contains('on'))return;
   $('vid').style.display='none';$('big').style.display='block';
@@ -359,30 +478,118 @@ $('btn-export').onclick=async()=>{
     modal('导出完成',`<div class="result">已导出 ${r.count} 个文件\nZIP：${r.path}\n大小：${fmt(r.bytes)}</div>`,[btn('下载 ZIP','primary',()=>location.href='/api/download?name='+encodeURIComponent(r.name)),btn('关闭','',closeModal)]);
   }catch(e){modal('导出失败',`<div class="result">${e.message}</div>`,[btn('关闭','',closeModal)])}
 };
+let delTimer=null;
+async function pollDelete(){
+  clearTimeout(delTimer);
+  let s;
+  try{s=await api('/api/delete/status')}catch(e){return}
+  const fill=$('dfill');
+  if(fill){
+    const pct=s.total?Math.min(100,Math.round(s.done*100/s.total)):100;
+    fill.style.width=pct+'%';
+    const n=$('dnum');if(n)n.innerHTML=`已处理 <b>${s.done}</b> / ${s.total}（${pct}%）`;
+    const c=$('dcur');if(c)c.textContent=s.current?('当前：'+s.current):(s.finished?'已完成':'准备中…');
+    const b=$('dbytes');
+    if(b)b.textContent=`${fmt(s.bytes_done)} / ${fmt(s.bytes_total)}`+(s.failed?`　失败 ${s.failed} 个`:'');
+  }
+  if(s.finished){
+    const r=s.result||{};
+    load(true);
+    modal('删除结果',`<div class="result">已移入回收站：${r.deleted} 个文件（${r.batches} 批）\n失败：${r.failed} 个${r.stopped_early?'\n已中止剩余批次':''}\n日志：${r.log}\n\n可从系统回收站还原。</div>`,[btn('关闭','',closeModal)]);
+    return;
+  }
+  delTimer=setTimeout(pollDelete,300);
+}
+function showDeleteProgress(total,bytes){
+  modal('正在移入回收站（第二步：执行中）',`<div class="dprog">
+    <div class="num" id="dnum">已处理 <b>0</b> / ${total}（0%）</div>
+    <div class="track"><div id="dfill"></div></div>
+    <div class="cur" id="dcur">准备中…</div>
+    <div class="num" id="dbytes" style="color:var(--sub)">0 KB / ${fmt(bytes)}</div>
+  </div>`,[btn('关闭','',()=>{clearTimeout(delTimer);closeModal();load(true)})]);
+  pollDelete();
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function openLogs(){
+  let d;
+  try{d=await api('/api/logs?limit=300')}
+  catch(e){modal('操作日志',`<div class="result">${esc(e.message)}</div>`,[btn('关闭','',closeModal)]);return}
+  const rows=d.items.length?d.items.map(it=>{
+    const files=(it.files&&it.files.length)
+      ? `<div class="lfiles">${it.files.map(esc).join('、')}${it.count>it.files.length?` 等 ${it.count} 个`:''}</div>` : '';
+    return `<div class="lrow${it.ok===false?' bad':''}">
+      <div class="lhead"><span class="ltime">${esc(it.time)}</span><span class="lip">${esc(it.ip)}</span><span class="ltag">${esc(it.label||it.action)}</span></div>
+      ${it.detail?`<div class="ldetail">${esc(it.detail)}</div>`:''}${files}</div>`;
+  }).join(''):'<div class="lrow" style="color:#6b7280">暂无操作记录</div>';
+  const body=`<div class="lbar">当前来源 IP：<b>${esc(d.ip)}</b>　共 <b>${d.total}</b> 条（倒序，最多显示 300 条）</div>
+    <div class="llist">${rows}</div>`;
+  modal('操作日志',body,[
+    btn('刷新','',openLogs),
+    btn('一键清空','danger',()=>clearLogs(d.clear_word,d.total)),
+    btn('关闭','',closeModal)
+  ]);
+}
+function clearLogs(word,total){
+  const body=`<div class="warn">⚠️ 将删除全部 ${total} 条操作记录，不可恢复；只会留下一条「清空日志」的痕迹。</div>
+    <div>请输入 <b>${word}</b> 完成二次确认：<br><input id="lword" style="width:320px;margin-top:6px" autocomplete="off" placeholder="手工输入确认词"></div>`;
+  modal('清空操作日志（二次确认）',body,[
+    btn('取消','',openLogs),
+    btn('确认清空','danger',async()=>{
+      const w=$('lword').value.trim();
+      if(w!==word){alert('确认词不正确，未清空任何日志');return}
+      try{const r=await post('/api/logs/clear',{confirm:w});alert(`已清空 ${r.cleared} 条记录`);openLogs()}
+      catch(e){alert(e.message)}
+    })
+  ]);
+}
+if($('btn-logs'))$('btn-logs').onclick=openLogs;
 $('btn-delete').onclick=async()=>{
   if(!SEL.size||!ALLOW)return;
   try{
     const p=await post('/api/delete/preview',stub());PENDING=p.token;
-    const list=p.files.map(f=>`${f.path}　(${fmt(f.size)})`).join('<br>');
+    const chosen=new Set(p.kinds.filter(k=>k.default).map(k=>k.kind));
+    const krows=p.kinds.map(k=>`<label class="krow${chosen.has(k.kind)?' on':''}" data-kind="${k.kind}">
+        <input type="checkbox"${chosen.has(k.kind)?' checked':''}>
+        <span class="ktxt"><span class="klabel">${k.label}</span><span class="kdesc">${k.desc}</span></span>
+        <span class="kstat">${k.count} 个 · ${fmt(k.size)}</span>
+      </label>`).join('');
     const body=`<div class="warn">⚠️ ${p.warning}</div>
-      <div class="result">分组 <b>${p.group_count}</b> 项，实际文件 <b>${p.file_count}</b> 个，合计 <b>${fmt(p.total_size)}</b>${p.hardlinked_files?`<br><span style="color:#dc2626">其中 ${p.hardlinked_files} 个是硬链接文件，删除后不一定立刻释放空间</span>`:''}</div>
-      <div class="list" style="margin:10px 0">${list}</div>
+      <div class="result">分组 <b>${p.group_count}</b> 项，共 ${p.file_count} 个文件，合计 ${fmt(p.total_size)}${p.hardlinked_files?`<br><span style="color:#dc2626">其中 ${p.hardlinked_files} 个是硬链接文件，删除后不一定立刻释放空间</span>`:''}</div>
+      <div style="margin:12px 0 6px;font-weight:600">选择要删除的文件类型</div>
+      <div id="klist">${krows}</div>
+      <div class="result" id="ksum" style="margin:8px 0 10px;color:#b91c1c"></div>
+      <div id="dlist" class="list" style="max-height:180px;margin-bottom:12px"></div>
       <div>请输入 <b>${p.confirm_word}</b> 完成二次确认：<br><input id="cword" style="width:320px;margin-top:6px" autocomplete="off" placeholder="手工输入确认词"></div>`;
+    const refresh=()=>{
+      const files=p.files.filter(f=>chosen.has(f.kind||'main'));
+      const size=files.reduce((a,f)=>a+f.size,0);
+      $('ksum').innerHTML=files.length?`将删除 <b>${files.length}</b> 个文件，合计 <b>${fmt(size)}</b>`:'<span style="color:#6b7280">未选择任何类型，不会删除文件</span>';
+      $('dlist').innerHTML=files.slice(0,500).map(f=>`${f.path}　(${fmt(f.size)})`).join('<br>')
+        +(files.length>500?`<br>… 其余 ${files.length-500} 个未列出`:'');
+    };
     modal('删除前确认（第一步：清单与风险）',body,[
       btn('取消','',closeModal),
       btn('第二步：移入回收站','danger',async()=>{
         const w=$('cword').value.trim();
         if(w!==p.confirm_word){alert('确认词不正确，未执行任何删除');return}
-        try{
-          const r=await post('/api/delete/commit',{token:p.token,confirm:w});
-          load(true);
-          modal('删除结果',`<div class="result">已移入回收站：${r.deleted} 个文件（${r.batches} 批）\n失败：${r.failed} 个${r.stopped_early?'\n已中止剩余批次':''}\n日志：${r.log}\n\n可从系统回收站还原。</div>`,[btn('关闭','',closeModal)]);
-        }catch(e){modal('删除失败',`<div class="result">${e.message}</div>`,[btn('关闭','',closeModal)])}
+        if(!chosen.size){alert('请至少勾选一类文件');return}
+        let r;
+        try{r=await post('/api/delete/commit',{token:p.token,confirm:w,kinds:[...chosen]})}
+        catch(e){modal('删除失败',`<div class="result">${e.message}</div>`,[btn('关闭','',closeModal)]);return}
+        showDeleteProgress(r.total,r.bytes_total);
       })
     ]);
+    $('klist').addEventListener('change',e=>{
+      const row=e.target.closest('.krow');if(!row)return;
+      const k=row.dataset.kind;
+      if(e.target.checked)chosen.add(k);else chosen.delete(k);
+      row.classList.toggle('on',e.target.checked);
+      refresh();
+    });
+    refresh();
   }catch(e){modal('无法预览删除',`<div class="result">${e.message}</div>`,[btn('关闭','',closeModal)])}
 };
-$('box').onclick=e=>{if(e.target.id==='box')closeBox()};
+$('box').onclick=e=>{if(e.target.id==='box'&&!SUPPRESS)closeBox()};
 $('tipmask').onclick=hideTip;
 document.onkeydown=e=>{if(e.key==='Escape'){closeBox();closeModal();hideTip()}};
 if(MOBILE){
@@ -432,8 +639,12 @@ button{width:100%;margin-top:18px;padding:11px;border:0;border-radius:8px;backgr
 button:disabled{opacity:.5;cursor:not-allowed}
 .msg{margin-top:12px;font-size:12.5px;color:#dc2626;min-height:18px;line-height:1.5}
 .hint{margin-top:16px;font-size:11.5px;color:#9aa3ad;line-height:1.7}
-.pwline{display:flex;gap:8px;align-items:center}
-.pwline .toggle{width:auto;margin:0;padding:0 10px;background:#fff;color:#6b7280;border:1px solid #e3e6ea;border-radius:8px;font-size:12px}
+.pwbox{position:relative}
+.pwbox input{padding-right:46px}
+.pwbox .eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:32px;height:32px;margin:0;padding:0;
+  background:transparent;border:0;border-radius:6px;color:#8b929c;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.pwbox .eye:hover{background:#f1f3f6;color:#1f2329}
+.pwbox .eye svg{display:block}
 @media (max-width:520px){
   body{padding:0;align-items:stretch}
   .card{max-width:none;min-height:100vh;border:0;border-radius:0;padding:32px 22px;box-shadow:none;display:flex;flex-direction:column;justify-content:center}
@@ -452,7 +663,7 @@ AUTH_TEMPLATE = r"""<!DOCTYPE html>
   <p class="sub">__SUB__</p>
   <form id="f" autocomplete="off">
     <label>密码</label>
-    <div class="pwline"><input id="pw" type="password" autocomplete="current-password" placeholder="请输入密码"><button class="toggle" type="button" id="eye">显示</button></div>
+    <div class="pwbox"><input id="pw" type="password" autocomplete="current-password" placeholder="请输入密码"><button class="eye" type="button" id="eye" aria-label="显示密码" title="显示密码"><svg id="eyeicon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
     __CONFIRM__
     <button id="go" type="submit">__ACTION__</button>
   </form>
@@ -462,7 +673,15 @@ AUTH_TEMPLATE = r"""<!DOCTYPE html>
 <script>
 const MODE=__MODE__,BAN=__BAN__;
 const $=id=>document.getElementById(id);
-$('eye').onclick=()=>{const p=$('pw');const on=p.type==='password';p.type=on?'text':'password';$('eye').textContent=on?'隐藏':'显示'};
+const EYE_OPEN='<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>';
+const EYE_SHUT='<path d="M17.9 17.9A10.1 10.1 0 0 1 12 20c-7 0-11-8-11-8a18.5 18.5 0 0 1 5.1-5.9M9.9 4.2A9.1 9.1 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.2 3.2M14.1 14.1a3 3 0 1 1-4.2-4.2"/><line x1="1" y1="1" x2="23" y2="23"/>';
+$('eye').onclick=()=>{
+  const p=$('pw'),on=p.type==='password';
+  p.type=on?'text':'password';
+  $('eyeicon').innerHTML=on?EYE_SHUT:EYE_OPEN;
+  $('eye').title=$('eye').getAttribute('aria-label')=on?'隐藏密码':'显示密码';
+  p.focus();
+};
 if(BAN>0){
   $('go').disabled=true;$('pw').disabled=true;
   let left=BAN;
@@ -510,7 +729,7 @@ def auth_page(mobile: bool, setup: bool, ban_left: int = 0, local: bool = True) 
         sub = "请输入访问密码。"
         confirm = ""
         action = "登录"
-        hint = "连续输错 3 次（30 秒内）将禁止该 IP 访问 10 分钟。"
+        hint = ""                                 # 规则提示已移到「操作日志」里体现（含来源 IP）
     html = (AUTH_TEMPLATE
             .replace("__CSS__", AUTH_CSS)
             .replace("__TITLE__", title)
